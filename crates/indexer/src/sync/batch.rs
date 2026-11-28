@@ -24,6 +24,7 @@ use crate::db::writer::dotbit::resolve_dotbit_tx_activity;
 use crate::db::writer::object_activity_acc::ObjectCollectionActivityAccumulator;
 use crate::db::writer::DaoSnapshotBoundary;
 use crate::db::{BatchWriter, DaoWithdrawalContext};
+use crate::parser::dotcell::{DotCellProtocolFacts, DotCellRead};
 use crate::parser::{
     BitCellParser, BlockParser, CellParser, DaoParser, DidCkbParser, DotCellParser, DotbitParser,
     MnftParser, ScriptParser, SporeParser, TransactionParser, UdtParser,
@@ -71,31 +72,43 @@ impl PreCommitInvariantError {
     }
 }
 
-/// A `.cell` name cell the live writer indexes: output index, decoded name,
-/// records from the witness at that output's own index.
-type LiveDotCellNameCell = (
-    usize,
-    crate::parser::DotCellNameData,
-    Vec<crate::parser::dotcell::DotCellRecord>,
-);
-
-/// The `.cell` name cells a transaction creates, for the live writer.
-///
-/// A failure here is a deterministic property of committed chain data that
-/// the strict decoder rejects (spec §Fail Fast: layout version, records hash,
-/// own-index witness, UTF-8 label). Bulk build stops on the same block, so
-/// live must stop the same way — a pre-commit invariant, never the
-/// cleanup-and-retry path that would re-fetch and re-reject the block forever.
+/// Read name outputs with the same DotCell reader as bulk. Invalid v3 data
+/// still stops the batch before commit.
 fn live_dotcell_name_cells(
     tx: &crate::rpc::TransactionView,
     block_number: i64,
-) -> Result<Vec<LiveDotCellNameCell>> {
-    DotCellParser::parse_name_cells_with_output_indices(tx).map_err(|source| {
-        anyhow::Error::new(PreCommitInvariantError::new(
-            "dotcell name cell",
-            anyhow!("block={block_number}, {source:#}"),
-        ))
-    })
+) -> Result<Vec<(usize, DotCellRead<DotCellProtocolFacts>)>> {
+    let mut outputs = Vec::new();
+    for (index, (output, data)) in tx.outputs.iter().zip(&tx.outputs_data).enumerate() {
+        let Some(script) = &output.type_ else {
+            continue;
+        };
+        if !DotCellParser::is_account_type_script(&crate::rpc::parse_hex_to_bytes(
+            &script.code_hash,
+        )) {
+            continue;
+        }
+        let witness = tx
+            .witnesses
+            .get(index)
+            .map(|hex| crate::rpc::parse_hex_to_bytes(hex));
+        let read = DotCellParser::read_dotcell(
+            &crate::rpc::parse_hex_to_bytes(&script.args),
+            &crate::rpc::parse_hex_to_bytes(data),
+            witness.as_deref(),
+        )
+        .map_err(|source| {
+            PreCommitInvariantError::new(
+                "dotcell name cell",
+                anyhow!(
+                    "block={block_number}, tx={}, output_index={index}: {source:#}",
+                    tx.hash,
+                ),
+            )
+        })?;
+        outputs.push((index, read));
+    }
+    Ok(outputs)
 }
 
 pub(super) fn collect_missing_input_outpoints<T>(
@@ -471,7 +484,7 @@ struct ActivityInputIndexes<'a> {
     bit_cell_identity_ids: &'a HashMap<(Vec<u8>, i16), Vec<u8>>,
     /// The `.cell` name each consumed name cell carried, captured by the
     /// consume path. An input reaches the activity builder without its data.
-    dotcell_inputs: &'a HashMap<(Vec<u8>, i16), crate::parser::DotCellNameData>,
+    dotcell_inputs: &'a HashMap<(Vec<u8>, i16), DotCellRead<crate::parser::DotCellNameData>>,
 }
 
 fn build_activity_input_views<'a>(
@@ -561,7 +574,7 @@ fn build_activity_input_views<'a>(
                     .bit_cell_identity_ids
                     .get(&key)
                     .map(Vec::as_slice),
-                dotcell: indexes.dotcell_inputs.get(&key),
+                dotcell: indexes.dotcell_inputs.get(&key).map(DotCellRead::as_ref),
                 data,
                 is_dao_withdraw_request,
                 dao_compensation,
@@ -1768,8 +1781,8 @@ impl Indexer {
         spore_type_index_changes: HashMap<Vec<u8>, SporeTypeIndex>,
         spore_daily_changes: EntityDailyChanges<EntityDateKey>,
         cluster_daily_changes: EntityDailyChanges<EntityDateKey>,
-        object_type_index_changes: HashMap<Vec<u8>, MnftTypeIndex>,
-        object_daily_changes: EntityDailyChanges<EntityDateKey>,
+        mut object_type_index_changes: HashMap<Vec<u8>, MnftTypeIndex>,
+        mut object_daily_changes: EntityDailyChanges<EntityDateKey>,
         chain_tip: u64,
     ) -> Result<BatchWriteMetrics> {
         if all_parsed_blocks.is_empty() {
@@ -2236,18 +2249,8 @@ impl Indexer {
                 )
             })
         })?;
-        if !object_type_index_changes.is_empty() {
-            self.writer
-                .update_object_type_index_batch(&object_type_index_changes, &mut data_batch)?;
-        }
         entity_stats.with(|overlay| -> Result<()> {
             batch_undo_seq.with(|undo_seq| {
-                self.writer.update_object_daily_deltas_batch(
-                    &object_daily_changes,
-                    overlay,
-                    undo_seq,
-                    &mut domain_analytics_batch,
-                )?;
                 self.writer.update_cluster_daily_deltas_batch(
                     &cluster_daily_changes,
                     overlay,
@@ -2714,8 +2717,10 @@ impl Indexer {
         // the parser result retained by the identity write path.
         let mut resolved_bit_cell_ids: HashMap<(Vec<u8>, i16), Vec<u8>> = HashMap::new();
         // The `.cell` name each consumed name cell carried before it was spent.
-        let mut resolved_dotcell_inputs: HashMap<(Vec<u8>, i16), crate::parser::DotCellNameData> =
-            HashMap::new();
+        let mut resolved_dotcell_inputs: HashMap<
+            (Vec<u8>, i16),
+            DotCellRead<crate::parser::DotCellNameData>,
+        > = HashMap::new();
 
         // Group C: Object/Spore processing
         //
@@ -2896,46 +2901,47 @@ impl Indexer {
                             }
 
                             if !bulk_sync_active {
-                                let consumed_type_code_hash = input_cell_info
+                                let consumed_info = input_cell_info
                                     .get(&key)
-                                    .or_else(|| batch_cell_infos.get(&key))
-                                    .and_then(|info| info.type_code_hash.clone());
-                                let consumed_is_dotcell = consumed_type_code_hash
-                                    .as_deref()
-                                    .is_some_and(DotCellParser::is_account_type_script);
-
-                                // `.cell` consumption. It shares the outpoint
-                                // reverse index with spores but NOT the spore
-                                // consume path: a `.cell` name's ownership is in
-                                // its data, and its collection feed comes from
-                                // the state diff, not from a create/consume pair.
-                                if consumed_is_dotcell {
-                                    let name_id = spore_map.get(&key).ok_or_else(|| {
-                                        anyhow!(
-                                            "dotcell outpoint-id mapping missing for consumed name cell: block={}, tx=0x{}, prev_outpoint=0x{}:{}",
-                                            parsed.number,
-                                            hex::encode(tx_data.hash),
-                                            hex::encode(&key.0),
-                                            key.1
-                                        )
-                                    })?;
-                                    let name_id: [u8; 20] =
-                                        name_id.as_slice().try_into().map_err(|_| {
-                                            anyhow!(
-                                                "dotcell name id must be 20 bytes, got {}: block={}, tx=0x{}, prev_outpoint=0x{}:{}",
-                                                name_id.len(),
-                                                parsed.number,
-                                                hex::encode(tx_data.hash),
-                                                hex::encode(&key.0),
-                                                key.1
+                                    .or_else(|| batch_cell_infos.get(&key));
+                                let consumed_type_code_hash =
+                                    consumed_info.and_then(|info| info.type_code_hash.clone());
+                                if let Some(info) = consumed_info.filter(|info| {
+                                    info.type_code_hash
+                                        .as_deref()
+                                        .is_some_and(DotCellParser::is_account_type_script)
+                                }) {
+                                    let layout = self.writer
+                                        .dotcell_input_layout(&key, spore_map.get(&key).map(Vec::as_slice), &spore_state)
+                                        .with_context(|| {
+                                            format!(
+                                                "consuming DotCell: block={}, tx=0x{}, prev_outpoint=0x{}:{}",
+                                                parsed.number, hex::encode(tx_data.hash), hex::encode(&key.0), key.1
                                             )
                                         })?;
-                                    if let Some(previous) = self.writer.consume_dotcell_name(
-                                        &name_id,
-                                        parsed.number,
-                                        &mut data_batch,
-                                        &mut spore_state,
-                                    )? {
+                                    let previous = match layout {
+                                        DotCellRead::Unindexed => Some(DotCellRead::Unindexed),
+                                        DotCellRead::Item(name_id) => {
+                                            object_daily_changes.add(
+                                                parsed.number,
+                                                (
+                                                    DOTCELL_SENTINEL_COLLECTION.to_vec(),
+                                                    keys::timestamp_ms_to_date(ts_ms),
+                                                ),
+                                                -i128::from(info.capacity),
+                                                -i128::from(info.occupied_capacity),
+                                            )?;
+                                            self.writer
+                                                .consume_dotcell_name(
+                                                    &name_id,
+                                                    parsed.number,
+                                                    &mut data_batch,
+                                                    &mut spore_state,
+                                                )?
+                                                .map(DotCellRead::Item)
+                                        }
+                                    };
+                                    if let Some(previous) = previous {
                                         resolved_dotcell_inputs.insert(key.clone(), previous);
                                     }
                                 }
@@ -3205,8 +3211,7 @@ impl Indexer {
                     // as a Transfer, while a `.cell` transaction's meaning comes
                     // from the state diff (`DotCellDetector`). The feed entry is
                     // derived from the written protocol actions below.
-                    for (output_index, name, records) in live_dotcell_name_cells(tx, parsed.number)?
-                    {
+                    for (output_index, layout) in live_dotcell_name_cells(tx, parsed.number)? {
                         let output_index_i16 = checked_usize_to_i16(
                             output_index,
                             "dotcell output index while processing grouped blocks",
@@ -3219,35 +3224,45 @@ impl Indexer {
                                 hex::encode(tx_data.hash)
                             )
                         })?;
-                        let type_script = tx.outputs[output_index]
-                            .type_
-                            .as_ref()
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "dotcell output has no type script: block={}, tx_hash=0x{}, output_index={}",
-                                    parsed.number,
-                                    hex::encode(tx_data.hash),
-                                    output_index
-                                )
-                            })?;
-                        let namespace_args: [u8; 20] =
-                            crate::rpc::parse_hex_to_bytes(&type_script.args)
-                                .try_into()
-                                .map_err(
-                                |args: Vec<u8>| {
-                                    anyhow!(
-                                        "dotcell namespace args must be 20 bytes, got {}: block={}, tx_hash=0x{}, output_index={}",
-                                        args.len(),
-                                        parsed.number,
-                                        hex::encode(tx_data.hash),
-                                        output_index
-                                    )
-                                },
+                        let cell = &tx_data.cells[output_index];
+                        let DotCellRead::Item(facts) = layout else {
+                            tracing::warn!(block = parsed.number, tx = %hex::encode(tx_data.hash), output_index, version = cell.data.first(), "unsupported DotCell layout");
+                            self.writer.mark_unsupported_dotcell(
+                                &tx_data.hash,
+                                output_index_i16,
+                                parsed.number,
+                                &mut data_batch,
+                                &mut spore_state,
                             )?;
+                            continue;
+                        };
+                        object_daily_changes.add(
+                            parsed.number,
+                            (
+                                DOTCELL_SENTINEL_COLLECTION.to_vec(),
+                                keys::timestamp_ms_to_date(ts_ms),
+                            ),
+                            i128::from(cell.capacity),
+                            occupied_capacity_shannons_i128(
+                                cell.lock_args.len(),
+                                cell.type_args.as_ref().map(Vec::len),
+                                cell.data_size,
+                            ),
+                        )?;
+                        let type_hash = cell
+                            .type_script_hash
+                            .as_ref()
+                            .context("missing DotCell type script hash")?;
+                        object_type_index_changes.insert(
+                            type_hash.clone(),
+                            MnftTypeIndex {
+                                collection_id: DOTCELL_SENTINEL_COLLECTION.to_vec(),
+                            },
+                        );
                         self.writer.insert_dotcell_name(
-                            &name,
-                            &records,
-                            &namespace_args,
+                            &facts.name,
+                            &facts.records,
+                            &facts.namespace_args,
                             &tx_data.hash,
                             output_index_i16,
                             parsed.number,
@@ -3372,6 +3387,21 @@ impl Indexer {
                 }
                 block_tx_idx += tx_count_for_block;
             }
+
+            if !object_type_index_changes.is_empty() {
+                self.writer
+                    .update_object_type_index_batch(&object_type_index_changes, &mut data_batch)?;
+            }
+            entity_stats.with(|overlay| {
+                batch_undo_seq.with(|seq| {
+                    self.writer.update_object_daily_deltas_batch(
+                        &object_daily_changes,
+                        overlay,
+                        seq,
+                        &mut domain_analytics_batch,
+                    )
+                })
+            })?;
 
             // Write .bit collection activities directly (bypassing accumulator)
             for (tx_hash, activity) in &dotbit_tx_activity_data {
@@ -8473,6 +8503,108 @@ mod tests {
                 vec![cellbase_tx(0xc3, 100_000_000), recreate_root],
             ));
             blocks
+        }
+
+        #[tokio::test]
+        async fn live_spend_resumes_from_an_unsupported_dotcell_marker() {
+            let _guard =
+                crate::db::writer::activities::test_detector_override::without_extra_detectors();
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(CkbadgerStore::open_test_unified(dir.path()).unwrap());
+            let indexer = super::live_dao_fee::indexer_for_live_write_test(store.clone());
+            store
+                .set_secondary_epoch_reward(61_369_863_013_698)
+                .unwrap();
+            super::live_dao_fee::seed_pre_parent_header(&store);
+            super::live_dao_fee::seed_secp_script_info(&store);
+            for code in [
+                fixture::ACCOUNT_TYPE_CODE_HASH_TESTNET,
+                fixture::ACCOUNT_LOCK_CODE_HASH_TESTNET,
+            ] {
+                super::live_dao_fee::seed_script_info(&store, code);
+            }
+            let mut blocks = ring_root_recreation_blocks();
+            let spend = blocks.pop().unwrap();
+            for block in blocks {
+                super::live_dao_fee::write_live_block(&indexer, block)
+                    .await
+                    .unwrap();
+            }
+
+            // Seed the prior snapshot at the classification boundary. Reuse a
+            // v3 fixture's ordinary CKB rows, replacing only the root's domain
+            // projection. The spending block is the original healthy fixture.
+            let previous = [0xe1; 32];
+            let cell = store.get_cell(&previous, 0, &store).unwrap().unwrap();
+            let root_id = DotCellParser::derive_id("");
+            store
+                .delete_cf(
+                    store.cf_dotcell_ring(),
+                    &crate::rpc::parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET),
+                )
+                .unwrap();
+            for key in [
+                keys::encode_spore_outpoint_key(&previous, 0).to_vec(),
+                keys::encode_spore_outpoint_by_id_key(&root_id, &previous, 0),
+            ] {
+                store.delete_cf(store.cf_stats_spore(), &key).unwrap();
+            }
+            let marker = keys::encode_dotcell_unsupported_key(&previous, 0);
+            store.put_cf(store.cf_stats_spore(), &marker, &[]).unwrap();
+            let date =
+                keys::timestamp_ms_to_date(store.get_block_header(101).unwrap().unwrap().timestamp);
+            let mut daily = store
+                .get_mnft_daily_delta(&DOTCELL_SENTINEL_COLLECTION, date)
+                .unwrap()
+                .unwrap();
+            daily.owned_capacity_delta -= i128::from(cell.capacity);
+            daily.owned_knowledge_delta -= i128::from(cell.occupied_capacity);
+            store
+                .put_mnft_daily_delta(&DOTCELL_SENTINEL_COLLECTION, date, &daily)
+                .unwrap();
+
+            super::live_dao_fee::write_live_block(&indexer, spend)
+                .await
+                .unwrap();
+            assert_eq!(store.get_sync_status().unwrap().tip_block_number, 103);
+            let consumed = store
+                .get_consumed_cell_info(&previous, 0, &store)
+                .unwrap()
+                .unwrap();
+            assert_eq!(consumed.cell, cell.cell);
+            assert_eq!(consumed.consumed_by_tx, Some(vec![0xe7; 32]));
+            assert_eq!(
+                store.get_cf(store.cf_stats_spore(), &marker).unwrap(),
+                Some(vec![])
+            );
+            let output = store.get_cell(&[0xe7; 32], 0, &store).unwrap().unwrap();
+            let after = store
+                .get_mnft_daily_delta(&DOTCELL_SENTINEL_COLLECTION, date)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.owned_capacity_delta,
+                daily.owned_capacity_delta + i128::from(output.capacity)
+            );
+            assert_eq!(
+                after.owned_knowledge_delta,
+                daily.owned_knowledge_delta + i128::from(output.occupied_capacity)
+            );
+            assert!(store
+                .get_tx_actions(103, 1, &[0xe7; 32])
+                .unwrap()
+                .unwrap()
+                .protocol_actions
+                .iter()
+                .all(|action| action.protocol != "dotcell"));
+
+            let undo = store.rollback_via_undo_log(&store, 102).unwrap();
+            store
+                .rollback_to_block_with_tx_contexts(102, Some(&store), undo.tx_contexts)
+                .unwrap();
+            assert_eq!(store.get_cell(&previous, 0, &store).unwrap(), Some(cell));
+            assert_eq!(store.get_stats_key(&marker).unwrap(), Some(vec![]));
+            assert!(store.get_cell(&[0xe7; 32], 0, &store).unwrap().is_none());
         }
 
         /// 5.2: bulk sees the consumed root's state, live does not; the tx must

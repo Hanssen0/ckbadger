@@ -9,11 +9,15 @@ use anyhow::{anyhow, bail, Result};
 
 use ckbadger_store::batch::StoreBatch;
 use ckbadger_store::keys;
-use ckbadger_store::store::{CF_DOTCELL_NAME_BY_OWNER, CF_DOTCELL_RING, CF_IDENTITY_DATA};
+use ckbadger_store::store::{
+    CF_DOTCELL_NAME_BY_OWNER, CF_DOTCELL_RING, CF_IDENTITY_DATA, CF_STATS_SPORE,
+};
 use ckbadger_store::types::{
     derive_dotcell_id, DotCellNameData, DotCellRecord, DotCellRingRoot, IdentityEntry,
     IdentityExtra, IdentityStandard, DOTCELL_SENTINEL_COLLECTION,
 };
+
+use crate::parser::dotcell::DotCellRead;
 
 use super::spore::{IdentityOwnerKeyKind, SporeBatchState};
 use super::BatchWriter;
@@ -43,6 +47,54 @@ fn checked_dec(current: i64, label: &str, id: &[u8]) -> Result<i64> {
 }
 
 impl BatchWriter {
+    /// A marker belongs to the creating block. Spending the cell leaves the
+    /// marker intact, like a supported name's outpoint mapping.
+    pub(crate) fn mark_unsupported_dotcell(
+        &self,
+        tx_hash: &[u8],
+        index: i16,
+        block: i64,
+        batch: &mut StoreBatch,
+        state: &mut SporeBatchState,
+    ) -> Result<()> {
+        let key = keys::encode_dotcell_unsupported_key(tx_hash, index);
+        let previous = self.store.get_cf(self.store.cf_stats_spore(), &key)?;
+        self.record_object_undo(
+            batch,
+            block,
+            CF_STATS_SPORE,
+            &key,
+            previous,
+            &state.undo_seq_by_block,
+        );
+        batch.put_stats(&key, &[]);
+        state.unsupported_dotcell.insert((tx_hash.to_vec(), index));
+        Ok(())
+    }
+
+    pub(crate) fn dotcell_input_layout(
+        &self,
+        outpoint: &(Vec<u8>, i16),
+        name_id: Option<&[u8]>,
+        state: &SporeBatchState,
+    ) -> Result<DotCellRead<[u8; 20]>> {
+        // Upstream checks the unindexed marker only if the normal row is absent.
+        if let Some(id) = name_id {
+            return Ok(DotCellRead::Item(id.try_into().map_err(|_| {
+                anyhow!("dotcell name id must be 20 bytes, got {}", id.len())
+            })?));
+        }
+        if state.unsupported_dotcell.contains(outpoint) {
+            return Ok(DotCellRead::Unindexed);
+        }
+        let key = keys::encode_dotcell_unsupported_key(&outpoint.0, outpoint.1);
+        match self.store.get_cf(self.store.cf_stats_spore(), &key)? {
+            Some(value) if value.is_empty() => Ok(DotCellRead::Unindexed),
+            Some(_) => bail!("unindexed DotCell outpoint marker carries a value"),
+            None => bail!("dotcell outpoint-id mapping missing for consumed name cell without an unindexed marker"),
+        }
+    }
+
     /// A network runs exactly one `.cell` namespace. Two would make bare
     /// 20-byte ids collide on identical labels, so a second one stops the sync
     /// rather than silently merging two name spaces into one collection.
@@ -486,6 +538,59 @@ mod tests {
         out.sort();
         out.dedup();
         out
+    }
+
+    #[test]
+    fn unsupported_dotcell_marker_resolves_across_batches_and_rolls_back() {
+        let (store, writer, _dir) = writer_for_test();
+        let tx = [0x86; 32];
+        let key = (tx.to_vec(), 1);
+        let mut state = new_state(&writer);
+        let mut batch = StoreBatch::new(&store);
+        writer
+            .mark_unsupported_dotcell(&tx, 1, 101, &mut batch, &mut state)
+            .unwrap();
+        assert_eq!(
+            writer.dotcell_input_layout(&key, None, &state).unwrap(),
+            DotCellRead::Unindexed
+        );
+        batch.commit().unwrap();
+
+        let fresh = new_state(&writer);
+        assert_eq!(
+            writer.dotcell_input_layout(&key, None, &fresh).unwrap(),
+            DotCellRead::Unindexed
+        );
+        assert!(store.get_spore_id_by_outpoint(&tx, 1).unwrap().is_none());
+        let id = support_name().id;
+        assert_eq!(
+            writer
+                .dotcell_input_layout(&(tx.to_vec(), 2), Some(&id), &fresh)
+                .unwrap(),
+            DotCellRead::Item(id)
+        );
+
+        let append_dir = tempfile::tempdir().unwrap();
+        let append = CkbadgerStore::open_append_only(append_dir.path()).unwrap();
+        assert_eq!(
+            store
+                .rollback_via_undo_log(&append, 100)
+                .unwrap()
+                .domain_ops_applied,
+            1
+        );
+        assert!(writer.dotcell_input_layout(&key, None, &fresh).is_err());
+        let marker = keys::encode_dotcell_unsupported_key(&tx, 1);
+        store.put_cf(store.cf_stats_spore(), &marker, b"x").unwrap();
+        assert!(writer
+            .dotcell_input_layout(&key, None, &fresh)
+            .unwrap_err()
+            .to_string()
+            .contains("marker carries a value"));
+        assert!(append
+            .iterator_cf(append.cf_cells(), rocksdb::IteratorMode::Start)
+            .next()
+            .is_none());
     }
 
     #[test]

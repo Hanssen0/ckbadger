@@ -48,6 +48,7 @@ pub(crate) struct SporeBatchState {
     identity_owner_counts: HashMap<(Vec<u8>, Vec<u8>), i64>,
     stats: SharedEntityStatsOverlay,
     spore_outpoints: HashMap<(Vec<u8>, i16), Vec<u8>>,
+    pub(super) unsupported_dotcell: HashSet<(Vec<u8>, i16)>,
     /// `.cell` namespaces seen in this batch, plus the ones already on disk.
     /// A network runs exactly one.
     dotcell_namespaces: HashSet<[u8; 20]>,

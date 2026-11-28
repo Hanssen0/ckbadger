@@ -9,7 +9,8 @@ use crate::parser::bit_cell::BitCellParser;
 use crate::parser::cell::ParsedCell;
 use crate::parser::did_ckb::DidCkbParser;
 use crate::parser::dotbit::{DotbitParser, DotbitWitnessBundle};
-use crate::parser::dotcell::{DotCellNameData, DotCellParser, DotCellRecord};
+pub(crate) use crate::parser::dotcell::DotCellProtocolFacts;
+use crate::parser::dotcell::{DotCellParser, DotCellRead};
 use crate::parser::mnft::MnftParser;
 use crate::parser::spore::SporeParser;
 use crate::sync::types::InternId;
@@ -112,16 +113,6 @@ pub(crate) struct BitCellProtocolFacts {
     pub(crate) expired_at: u64,
 }
 
-/// A `.cell` name cell: the decoded header/label plus the records payload from
-/// the `WitnessArgs.output_type` at this output's own index, whose blake2b is
-/// `data[1..33]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct DotCellProtocolFacts {
-    pub(crate) name: DotCellNameData,
-    pub(crate) namespace_args: [u8; 20],
-    pub(crate) records: Vec<DotCellRecord>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum CellProtocolFacts {
     Spore(SporeProtocolFacts),
@@ -133,6 +124,7 @@ pub(crate) enum CellProtocolFacts {
     Dotbit(DotbitProtocolFacts),
     BitCell(BitCellProtocolFacts),
     DotCell(DotCellProtocolFacts),
+    UnindexedDotCell,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,47 +353,21 @@ pub(crate) fn parse_protocol_facts(
         | CellSemanticTag::Sudt
         | CellSemanticTag::Xudt => Ok(None),
         CellSemanticTag::DotCell => {
-            let name = DotCellParser::parse_name_parsed_cell(cell)
-                .map_err(|e| {
-                    anyhow!(
-                        "dotcell name cell parse failed: tx=0x{}, output_index={}: {e}",
-                        hex::encode(tx_hash),
-                        output_index
-                    )
-                })?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "semantic tag DotCell but cell is not a Cells Account cell: tx=0x{}, output_index={}",
-                        hex::encode(tx_hash),
-                        output_index
-                    )
-                })?;
-            let witness = witness.ok_or_else(|| {
+            let read = DotCellParser::read_dotcell(
+                cell.type_args.as_deref().unwrap_or_default(),
+                &cell.data,
+                witness,
+            )
+            .map_err(|error| {
                 anyhow!(
-                    "dotcell name cell has no witness at its output index: tx=0x{}, output_index={}",
-                    hex::encode(tx_hash),
-                    output_index
+                    "dotcell name cell parse failed: tx=0x{}, output_index={output_index}: {error:#}",
+                    hex::encode(tx_hash)
                 )
             })?;
-            let records = DotCellParser::parse_witness_records_bytes(witness, &name.records_hash)
-                .map_err(|e| {
-                anyhow!(
-                    "dotcell records: tx=0x{}, output_index={}: {e}",
-                    hex::encode(tx_hash),
-                    output_index
-                )
-            })?;
-            let namespace_args = parse_fixed_protocol_id::<20>(
-                cell.type_args.as_deref().unwrap_or(&[]),
-                "dotcell namespace args",
-                tx_hash,
-                output_index,
-            )?;
-            Ok(Some(CellProtocolFacts::DotCell(DotCellProtocolFacts {
-                name,
-                namespace_args,
-                records,
-            })))
+            Ok(Some(match read {
+                DotCellRead::Item(facts) => CellProtocolFacts::DotCell(facts),
+                DotCellRead::Unindexed => CellProtocolFacts::UnindexedDotCell,
+            }))
         }
         CellSemanticTag::BitCell => {
             let cell = BitCellParser::parse_parsed_cell(cell).ok_or_else(|| {

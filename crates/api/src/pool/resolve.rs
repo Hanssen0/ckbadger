@@ -285,7 +285,10 @@ impl ResolvedPoolTx {
                 bit_cell_identity_id: None,
                 // `.cell` is the exception: the classifier reads a consumed
                 // name's previous state from this field, never from the data.
-                dotcell: cell.dotcell.as_ref(),
+                dotcell: cell
+                    .dotcell
+                    .as_ref()
+                    .map(ckbadger_indexer::parser::dotcell::DotCellRead::Item),
                 data: &cell.data,
                 // Same two fields live sync fills from its DAO map: the
                 // resolver priced every spent withdraw-request cell, so the

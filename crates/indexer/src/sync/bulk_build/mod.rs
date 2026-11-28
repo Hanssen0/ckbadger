@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::parser::dotcell::DotCellRead;
 use anyhow::Result;
 use anyhow::{anyhow, bail, Context};
 use ckb_types::utilities::compact_to_difficulty as ckb_compact_to_difficulty;
@@ -4105,7 +4106,8 @@ fn build_tx_actions_list_for_bulk(
                         // consumed name's state comes from the facts stored
                         // when the cell was created.
                         dotcell: match input.protocol_facts.as_ref() {
-                            Some(facts::CellProtocolFacts::DotCell(dotcell)) => Some(&dotcell.name),
+                            Some(facts::CellProtocolFacts::DotCell(dotcell)) => Some(DotCellRead::Item(&dotcell.name)),
+                            Some(facts::CellProtocolFacts::UnindexedDotCell) => Some(DotCellRead::Unindexed),
                             _ => None,
                         },
                         data: &[],
@@ -4487,7 +4489,8 @@ fn build_history_rows_for_block(
                     // accumulator: it would read a re-created name as a
                     // Transfer. Its feed entry is derived from the `dotcell:*`
                     // actions below, by the same function live sync uses.
-                    facts::CellProtocolFacts::DotCell(_) => {}
+                    facts::CellProtocolFacts::DotCell(_)
+                    | facts::CellProtocolFacts::UnindexedDotCell => {}
                     facts::CellProtocolFacts::Cluster(_)
                     | facts::CellProtocolFacts::MnftIssuer(_)
                     | facts::CellProtocolFacts::MnftClass(_) => {}
@@ -4556,7 +4559,8 @@ fn build_history_rows_for_block(
                     }
                     // See the input side: the `.cell` feed is derived from the
                     // protocol actions, not from create/consume pairs.
-                    facts::CellProtocolFacts::DotCell(_) => {}
+                    facts::CellProtocolFacts::DotCell(_)
+                    | facts::CellProtocolFacts::UnindexedDotCell => {}
                     facts::CellProtocolFacts::Cluster(_)
                     | facts::CellProtocolFacts::MnftIssuer(_)
                     | facts::CellProtocolFacts::MnftClass(_) => {}

@@ -681,6 +681,7 @@ impl ObjectOwner {
             CellProtocolFacts::Dotbit(dotbit) => self.consume_dotbit(&dotbit.account_id),
             CellProtocolFacts::BitCell(bit_cell) => self.consume_bit_cell(&bit_cell.identity_id),
             CellProtocolFacts::DotCell(facts) => self.consume_dotcell(&facts.name.id),
+            CellProtocolFacts::UnindexedDotCell => Ok(()),
         }
     }
 
@@ -726,6 +727,13 @@ impl ObjectOwner {
                     .map(Vec::as_slice),
             ),
             CellProtocolFacts::BitCell(bit_cell) => self.insert_bit_cell(bit_cell, cell, ctx, tx),
+            CellProtocolFacts::UnindexedDotCell => {
+                let index = Self::as_i16_outpoint_index(&cell.outpoint, "dotcell")?;
+                let key = keys::encode_dotcell_unsupported_key(&cell.outpoint.tx_hash, index);
+                self.stats_spore_rows.insert(key.to_vec(), Vec::new());
+                tracing::warn!(block = tx.block_number, tx = %hex::encode(cell.outpoint.tx_hash), output_index = index, version = cell.data.first(), "unsupported DotCell layout");
+                Ok(())
+            }
             CellProtocolFacts::DotCell(facts) => self.insert_dotcell(facts, cell, tx),
         }
     }
@@ -2789,7 +2797,8 @@ fn classify_nft_collection_from_protocol(
         CellProtocolFacts::BitCell(_) => Some(BIT_CELL_SENTINEL_COLLECTION.to_vec()),
         CellProtocolFacts::DidCkb(_) => Some(DID_CKB_SENTINEL_COLLECTION.to_vec()),
         CellProtocolFacts::DotCell(_) => Some(DOTCELL_SENTINEL_COLLECTION.to_vec()),
-        CellProtocolFacts::Spore(_)
+        CellProtocolFacts::UnindexedDotCell
+        | CellProtocolFacts::Spore(_)
         | CellProtocolFacts::Cluster(_)
         | CellProtocolFacts::MnftIssuer(_)
         | CellProtocolFacts::MnftClass(_) => None,
@@ -3314,6 +3323,12 @@ mod tests {
                 Some(expected.clone()),
                 "{label}: bulk classification"
             );
+            if expected == DOTCELL_SENTINEL_COLLECTION {
+                // A script alone cannot prove this is a name. Live v3 deltas
+                // are compared with bulk's actual rows in the registration test.
+                assert_eq!(from_live, None);
+                continue;
+            }
             assert_eq!(
                 from_live,
                 Some(expected),
@@ -3620,6 +3635,31 @@ mod tests {
             }]
             .into(),
         }
+    }
+
+    #[test]
+    fn unsupported_dotcell_bulk_facts_materialize_only_the_marker() {
+        let interner = IdentityInterner::default();
+        let lock = interner.intern_bytes(vec![0xcc; 32]);
+        let frozen = interner.snapshot_for_reads();
+        let ctx = ReducerContext::new(&frozen);
+        let tx_hash = [0x86; 32];
+        let mut tx = did_ckb_tx_facts(Vec::new(), tx_hash, lock);
+        let cell = &mut tx.cells.to_mut()[0];
+        cell.semantic_tag = CellSemanticTag::DotCell;
+        cell.protocol_facts = Some(CellProtocolFacts::UnindexedDotCell);
+        let mut owner = ObjectOwner::default();
+        owner.apply_tx(&tx, &ctx).unwrap();
+        let rows = owner.build_sealed_rows().unwrap();
+        assert!(owner.build_snapshot_rows().unwrap().is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cf_name, CF_STATS_SPORE);
+        assert_eq!(
+            rows[0].key,
+            keys::encode_dotcell_unsupported_key(&tx_hash, 0)
+        );
+        assert!(rows[0].value.is_empty());
+        assert!(owner.object_daily_deltas.is_empty());
     }
 
     /// Live/bulk parity: a real-shaped 20-byte did:ckb item id indexes in the

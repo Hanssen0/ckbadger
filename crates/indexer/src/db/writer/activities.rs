@@ -14,7 +14,10 @@ use ckbadger_store::types::{
 };
 
 use crate::parser::{
-    bit_cell::BitCellParser, dotbit::DotbitParser, dotcell::DotCellNameData, udt::UdtParser,
+    bit_cell::BitCellParser,
+    dotbit::DotbitParser,
+    dotcell::{DotCellNameData, DotCellRead},
+    udt::UdtParser,
 };
 
 static CODE_HASHES: OnceLock<CodeHashes> = OnceLock::new();
@@ -168,7 +171,7 @@ pub struct InputCellView<'a> {
     /// Both sync paths must fill it — bulk from the cell's stored protocol
     /// facts, live from the identity entry the consume path just read — because
     /// an input cell reaches the activity builder without its data.
-    pub dotcell: Option<&'a DotCellNameData>,
+    pub dotcell: Option<DotCellRead<&'a DotCellNameData>>,
     pub data: &'a [u8],
     pub is_dao_withdraw_request: bool,
     pub dao_compensation: Option<i64>,
@@ -1464,7 +1467,7 @@ pub(crate) mod test_fixtures {
                 type_args: self.type_args.as_deref(),
                 udt_amount: self.udt_amount,
                 bit_cell_identity_id: None,
-                dotcell: self.dotcell.as_ref(),
+                dotcell: self.dotcell.as_ref().map(super::DotCellRead::Item),
                 data: &self.data,
                 is_dao_withdraw_request: self.is_dao_withdraw_request,
                 dao_compensation: self.dao_compensation,

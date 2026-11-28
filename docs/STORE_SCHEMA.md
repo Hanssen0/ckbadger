@@ -98,6 +98,13 @@ The other cell indexes (`cell_by_lock`, `cell_by_type`, `cell_by_data_hash`) are
 script hash or data hash, which already encodes `hash_type`, so they keep the 74-byte
 `hash(32) + block(8 BE) + outpoint(34)` shape.
 
+### Unsupported DotCell name layouts (0.8.3)
+
+An unsupported Cells Account layout is marked in domain `stats_spore` under
+`0x30 ‖ encode_outpoint(tx_hash, output_index)` with an empty value. The marker
+survives consumption and live rollback removes it with its creating block.
+Existing v3 outpoint and cell rows keep their formats.
+
 ### `identity_by_collection`: `.cell` parent→child rows
 
 Beside the `(sentinel, identity_id)` row every identity has, a `.cell` sub-name gets a second row

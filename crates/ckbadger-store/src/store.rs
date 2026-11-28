@@ -2012,7 +2012,8 @@ impl CkbadgerStore {
             | keys::STATS_PREFIX_SPORE_DAILY
             | keys::STATS_PREFIX_SPORE_OUTPOINT
             | keys::STATS_PREFIX_SPORE_TYPE_INDEX
-            | keys::STATS_PREFIX_SPORE_OUTPOINT_BY_ID => Ok(self.cf_stats_spore()),
+            | keys::STATS_PREFIX_SPORE_OUTPOINT_BY_ID
+            | keys::stats_prefix::DOTCELL_UNSUPPORTED => Ok(self.cf_stats_spore()),
             keys::STATS_PREFIX_OBJECT_HOURLY
             | keys::STATS_PREFIX_OBJECT_DAILY
             | keys::STATS_PREFIX_OBJECT_TYPE_INDEX
@@ -2068,7 +2069,8 @@ impl CkbadgerStore {
             | keys::STATS_PREFIX_SPORE_DAILY
             | keys::STATS_PREFIX_SPORE_OUTPOINT
             | keys::STATS_PREFIX_SPORE_TYPE_INDEX
-            | keys::STATS_PREFIX_SPORE_OUTPOINT_BY_ID => Ok(CF_STATS_SPORE),
+            | keys::STATS_PREFIX_SPORE_OUTPOINT_BY_ID
+            | keys::stats_prefix::DOTCELL_UNSUPPORTED => Ok(CF_STATS_SPORE),
             keys::STATS_PREFIX_OBJECT_HOURLY
             | keys::STATS_PREFIX_OBJECT_DAILY
             | keys::STATS_PREFIX_OBJECT_TYPE_INDEX

@@ -16,7 +16,7 @@ use crate::rpc::{parse_hex_to_bytes, CellOutput, TransactionView};
 
 pub use ckbadger_store::types::{DotCellNameData, DotCellRecord};
 
-/// The only layout version ever written on either network.
+/// The name layout this release understands.
 pub const DOTCELL_LAYOUT_VERSION: u8 = 3;
 /// Fixed header length; the label runs from here to the end of the data.
 pub const DOTCELL_HEADER_LEN: usize = 98;
@@ -44,9 +44,63 @@ pub const DOTCELL_SALE_LOCK_ARGS_LEN: usize = 40;
 /// The 30-day grace period the contract enforces after expiry, in seconds.
 pub const DOTCELL_GRACE_SECONDS: u64 = 2_592_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotCellRead<T> {
+    Item(T),
+    Unindexed,
+}
+
+impl<T> DotCellRead<T> {
+    pub(crate) fn as_ref(&self) -> DotCellRead<&T> {
+        match self {
+            Self::Item(name) => DotCellRead::Item(name),
+            Self::Unindexed => DotCellRead::Unindexed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DotCellProtocolFacts {
+    pub(crate) name: DotCellNameData,
+    pub(crate) namespace_args: [u8; 20],
+    pub(crate) records: Vec<DotCellRecord>,
+}
+
 pub struct DotCellParser;
 
 impl DotCellParser {
+    pub(crate) fn unsupported_layout(data: &[u8]) -> bool {
+        data.first()
+            .is_some_and(|version| *version != DOTCELL_LAYOUT_VERSION)
+    }
+
+    /// DotCell-only backport of upstream read_dotcell. Keep 0.8.3's namespace
+    /// policy and strict v3 validation. Only an unknown layout is unindexed.
+    pub(crate) fn read_dotcell(
+        type_args: &[u8],
+        data: &[u8],
+        own_witness: Option<&[u8]>,
+    ) -> Result<DotCellRead<DotCellProtocolFacts>> {
+        let namespace_args: [u8; 20] = type_args.try_into().map_err(|_| {
+            anyhow!(
+                "dotcell namespace args must be 20 bytes, got {}",
+                type_args.len()
+            )
+        })?;
+        if Self::unsupported_layout(data) {
+            return Ok(DotCellRead::Unindexed);
+        }
+        let name = Self::parse_name_data(data)?;
+        let witness = own_witness
+            .ok_or_else(|| anyhow!("dotcell name cell has no witness at its output index"))?;
+        let records = Self::parse_witness_records_bytes(witness, &name.records_hash)?;
+        Ok(DotCellRead::Item(DotCellProtocolFacts {
+            name,
+            namespace_args,
+            records,
+        }))
+    }
+
     pub fn is_account_type_script(code_hash: &[u8]) -> bool {
         PROTOCOL_REGISTRY.is(code_hash, ProtocolScript::DotCellAccount)
     }

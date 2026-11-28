@@ -1378,7 +1378,9 @@ async fn test_dotcell_transfer_reads_the_same_in_the_pool_as_committed() {
                 type_args: name_cell.type_args.as_deref(),
                 udt_amount: None,
                 bit_cell_identity_id: None,
-                dotcell: Some(&previous_name),
+                dotcell: Some(ckbadger_indexer::parser::dotcell::DotCellRead::Item(
+                    &previous_name,
+                )),
                 data: &[],
                 is_dao_withdraw_request: false,
                 dao_compensation: None,

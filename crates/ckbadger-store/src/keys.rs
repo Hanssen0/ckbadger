@@ -832,6 +832,8 @@ pub mod stats_prefix {
     pub const ACTIVITY_DAILY_ADDR_SET: u8 = 0x23;
     /// Persistent address set for hourly unique address dedup across batches.
     pub const ACTIVITY_HOURLY_ADDR_SET: u8 = 0x24;
+    /// Domain stats_spore: unindexed DotCell outpoint marker (empty value).
+    pub const DOTCELL_UNSUPPORTED: u8 = 0x30;
 }
 
 // Flat re-exports for convenience
@@ -1039,6 +1041,13 @@ pub fn encode_spore_outpoint_key(
     let mut key = [0u8; SPORE_OUTPOINT_KEY_SIZE];
     key[0] = STATS_PREFIX_SPORE_OUTPOINT;
     key[1..35].copy_from_slice(&encode_outpoint(tx_hash, output_index));
+    key
+}
+
+pub fn encode_dotcell_unsupported_key(tx_hash: &[u8], output_index: i16) -> [u8; 35] {
+    let mut key = [0; 35];
+    key[0] = stats_prefix::DOTCELL_UNSUPPORTED;
+    key[1..].copy_from_slice(&encode_outpoint(tx_hash, output_index));
     key
 }
 
