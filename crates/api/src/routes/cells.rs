@@ -977,21 +977,20 @@ fn maybe_parse_dotbit_decode(
 }
 
 /// Layer-0 decode of a `.cell` name cell or the ring root: the values come
-/// from the indexer's own `DotCellParser::parse_name_data` and the segment
+/// from the indexer's own `DotCellParser::read_name_data` and the segment
 /// offsets from the parser's own field ranges — no second offset table here.
 ///
-/// `Ok(None)`: not a Cells Account cell. `Err`: it is one and its data does
-/// not decode. The indexer refuses to store such a cell (live and bulk both
-/// bail), so meeting one here is a broken invariant, never a guess.
+/// An unsupported layout has no deterministic decode. Malformed v3 data
+/// still reports the failing invariant.
 fn maybe_parse_dotcell_decode(
     info: &ckbadger_store::PositionedCellInfo,
     data: &[u8],
 ) -> anyhow::Result<Option<CellDeterministicDecode>> {
     use anyhow::Context as _;
     use ckbadger_indexer::parser::dotcell::{
-        DotCellParser, DOTCELL_EXPIRY_RANGE, DOTCELL_HEADER_LEN, DOTCELL_LAYOUT_VERSION_RANGE,
-        DOTCELL_MANAGER_RANGE, DOTCELL_NEXT_ID_RANGE, DOTCELL_OWNER_RANGE,
-        DOTCELL_RECORDS_HASH_RANGE, DOTCELL_ZERO_ID,
+        DotCellParser, DotCellRead, DOTCELL_EXPIRY_RANGE, DOTCELL_HEADER_LEN,
+        DOTCELL_LAYOUT_VERSION_RANGE, DOTCELL_MANAGER_RANGE, DOTCELL_NEXT_ID_RANGE,
+        DOTCELL_OWNER_RANGE, DOTCELL_RECORDS_HASH_RANGE, DOTCELL_ZERO_ID,
     };
 
     let Some(type_code_hash) = info.type_code_hash.as_deref() else {
@@ -1000,8 +999,11 @@ fn maybe_parse_dotcell_decode(
     if !DotCellParser::is_account_type_script(type_code_hash) {
         return Ok(None);
     }
-    let name =
-        DotCellParser::parse_name_data(data).context("dotcell name cell data does not decode")?;
+    let DotCellRead::Item(name) =
+        DotCellParser::read_name_data(data).context("dotcell name cell data does not decode")?
+    else {
+        return Ok(None);
+    };
 
     let hex = |bytes: &[u8]| format!("0x{}", hex::encode(bytes));
     let segment = |label: &str,
@@ -1514,14 +1516,18 @@ fn build_script_hint_guess(
             "high",
         )
     } else if PROTOCOL_REGISTRY.is(type_code_hash, ProtocolScript::DotCellAccount) {
-        // Unreachable in practice: an undecodable Account cell is an error in
-        // `maybe_parse_dotcell_decode`, never a hint. Kept so the family is
-        // described completely.
-        (
-            "Cells Account (.cell name)",
-            "expected 98-byte header (version, records hash, next id, u40 expiry, owner, manager) + UTF-8 label",
-            "high",
-        )
+        // The v3 decoder runs before script hints. Only its explicit
+        // unsupported-layout outcome can reach this branch.
+        return Some(CellDataGuess {
+            kind: "script_hint".into(),
+            confidence: "high".into(),
+            reason: format!(
+                "Cells Account type script with unsupported layout byte {}",
+                data.first()?
+            ),
+            mime_type: None,
+            human_value: None,
+        });
     } else if PROTOCOL_REGISTRY.is(type_code_hash, ProtocolScript::DotCellPrice) {
         // A price cell is not decoded on this page; say what it is without
         // claiming its bytes are wrong.

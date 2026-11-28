@@ -452,17 +452,18 @@ pub fn execute_check(
 const WARMUP_PENDING_MAX_ATTEMPTS: usize = 30;
 const WARMUP_PENDING_RETRY_DELAY_MS: u64 = 1_000;
 
-/// What one API GET produced: the decoded body, or a 404 carrying its detail.
-enum ApiGetOutcome<T> {
+/// What one API GET produced: the decoded body, or a 404 carrying its detail
+/// and raw response body.
+pub(super) enum ApiGetOutcome<T> {
     Found(T),
-    NotFound { detail: String },
+    NotFound { detail: String, body: String },
 }
 
 /// The one GET path every API read goes through: exponential-backoff retry on
 /// 429 (Too Many Requests) and warmup-pending retry on 503. A 404 is returned
 /// as [`ApiGetOutcome::NotFound`]; every other non-2xx, transport or decode
 /// failure is an error.
-fn api_get_outcome<T: serde::de::DeserializeOwned>(
+pub(super) fn api_get_outcome<T: serde::de::DeserializeOwned>(
     ctx: &CheckContext,
     path: &str,
 ) -> anyhow::Result<ApiGetOutcome<T>> {
@@ -501,7 +502,7 @@ fn api_get_outcome<T: serde::de::DeserializeOwned>(
                 format!(": {}", body.chars().take(512).collect::<String>())
             };
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(ApiGetOutcome::NotFound { detail });
+                return Ok(ApiGetOutcome::NotFound { detail, body });
             }
             anyhow::bail!("GET {} returned {}{}", path, status, detail);
         }
@@ -518,7 +519,7 @@ pub(super) fn api_get<T: serde::de::DeserializeOwned>(
 ) -> anyhow::Result<T> {
     match api_get_outcome(ctx, path)? {
         ApiGetOutcome::Found(value) => Ok(value),
-        ApiGetOutcome::NotFound { detail } => anyhow::bail!(
+        ApiGetOutcome::NotFound { detail, .. } => anyhow::bail!(
             "GET {} returned {}{}",
             path,
             reqwest::StatusCode::NOT_FOUND,

@@ -557,9 +557,8 @@ pub struct TransactionDetailResponse {
     pub outputs: Vec<TransactionOutputResponse>,
     pub witnesses: Vec<String>,
     pub witnesses_available: bool,
-    /// The `.cell` names this transaction creates, each with the records
-    /// payload decoded from the witness at its own output index. Absent when
-    /// the transaction creates none (or its witnesses are unavailable).
+    /// Decoded `.cell` names and the records from their own output witnesses.
+    /// Omitted when no names can be listed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dotcell_names: Vec<DotCellNameWitnessResponse>,
 }
@@ -578,82 +577,55 @@ pub struct DotCellNameWitnessResponse {
     pub records: Vec<DotCellRecordResponse>,
 }
 
-/// The same string-encoded transaction, in the indexer's RPC type: the direct
-/// reader and the node lookup mirror the indexer's `rpc::TransactionView`
-/// field for field, and the `.cell` parser takes the indexer's.
-fn indexer_tx_view(tx: &RpcTransactionView) -> ckbadger_indexer::rpc::TransactionView {
-    use ckbadger_indexer::rpc::{CellDep, CellInput, CellOutput, OutPoint, Script};
-
-    let out_point = |p: &ckb_store_reader::RpcOutPoint| OutPoint {
-        tx_hash: p.tx_hash.clone(),
-        index: p.index.clone(),
-    };
-    let script = |s: &ckb_store_reader::RpcScript| Script {
-        code_hash: s.code_hash.clone(),
-        hash_type: s.hash_type.clone(),
-        args: s.args.clone(),
-    };
-    ckbadger_indexer::rpc::TransactionView {
-        hash: tx.hash.clone(),
-        version: tx.version.clone(),
-        cell_deps: tx
-            .cell_deps
-            .iter()
-            .map(|dep| CellDep {
-                out_point: out_point(&dep.out_point),
-                dep_type: dep.dep_type.clone(),
-            })
-            .collect(),
-        header_deps: tx.header_deps.clone(),
-        inputs: tx
-            .inputs
-            .iter()
-            .map(|input| CellInput {
-                since: input.since.clone(),
-                previous_output: out_point(&input.previous_output),
-            })
-            .collect(),
-        outputs: tx
-            .outputs
-            .iter()
-            .map(|output| CellOutput {
-                capacity: output.capacity.clone(),
-                lock: script(&output.lock),
-                type_: output.type_.as_ref().map(script),
-            })
-            .collect(),
-        outputs_data: tx.outputs_data.clone(),
-        witnesses: tx.witnesses.clone(),
-    }
-}
-
-/// The `.cell` names a transaction creates, decoded by the exact function the
-/// live indexer runs (`DotCellParser::parse_name_cells_with_output_indices`).
-///
-/// A name cell whose own-index witness is missing or does not hash to the
-/// cell's records hash is an error, not an empty list: its type script was
-/// verified on chain (or by the pool), so the mismatch is a broken invariant.
-/// The ring root is verified the same way but not listed: it is protocol
-/// infrastructure, not a name with an identity.
+/// Read each Cells Account output with the indexer's layout and records checks.
 fn dotcell_names_for_tx(
     tx: &RpcTransactionView,
 ) -> Result<Vec<DotCellNameWitnessResponse>, ApiRouteError> {
-    let names = ckbadger_indexer::parser::DotCellParser::parse_name_cells_with_output_indices(
-        &indexer_tx_view(tx),
-    )
-    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-    Ok(names
-        .into_iter()
-        .filter(|(_, name, _)| !name.is_root())
-        .map(|(output_index, name, records)| DotCellNameWitnessResponse {
-            output_index,
+    use ckbadger_indexer::parser::dotcell::{DotCellParser, DotCellRead};
+
+    let mut names = Vec::new();
+    for (index, output) in tx.outputs.iter().enumerate() {
+        let Some(script) = &output.type_ else {
+            continue;
+        };
+        let context = format!("tx={}, output_index={index}", tx.hash);
+        let bytes =
+            |raw: &str, field: &str| decode_hex_bytes_with_context(raw, field, &context, None);
+        if !DotCellParser::is_account_type_script(&bytes(&script.code_hash, "type.code_hash")?) {
+            continue;
+        }
+        let data = tx
+            .outputs_data
+            .get(index)
+            .ok_or_else(|| ApiError::internal(format!("missing .cell output data: {context}")))?;
+        let witness = tx
+            .witnesses
+            .get(index)
+            .map(|w| bytes(w, "witness"))
+            .transpose()?;
+        let read = DotCellParser::read_dotcell(
+            &bytes(&script.args, "type.args")?,
+            &bytes(data, "output_data")?,
+            witness.as_deref(),
+        )
+        .map_err(|e| ApiError::internal(format!("dotcell name cell: {context}: {e:#}")))?;
+        let DotCellRead::Item(facts) = read else {
+            continue;
+        };
+        let name = facts.name;
+        if name.is_root() {
+            continue;
+        }
+        names.push(DotCellNameWitnessResponse {
+            output_index: index,
             name: format!("{}.cell", name.label),
             identity_id: format!("0x{}", hex::encode(name.id)),
             records_hash: format!("0x{}", hex::encode(name.records_hash)),
-            records: records.iter().map(dotcell_record_response).collect(),
+            records: facts.records.iter().map(dotcell_record_response).collect(),
             label: name.label,
-        })
-        .collect())
+        });
+    }
+    Ok(names)
 }
 
 #[cfg(test)]

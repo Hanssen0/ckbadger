@@ -1255,20 +1255,28 @@ async fn test_transaction_detail_decodes_dotcell_records_from_witness() {
     assert_eq!(joaom["records"].as_array().map(Vec::len), Some(0));
 }
 
-/// The pending (pool) builder decodes `.cell` records through the same call:
-/// a name registration waiting in the pool already shows its records.
+/// A mock node returns an opaque output followed by a known v3 name.
 #[tokio::test]
-async fn test_pending_transaction_detail_decodes_dotcell_records_from_witness() {
+async fn test_transaction_detail_keeps_opaque_dotcell_and_decodes_its_v3_sibling() {
+    for status in ["pending", "committed"] {
+        check_rpc_dotcell_detail(status).await;
+    }
+}
+
+async fn check_rpc_dotcell_detail(tx_status: &str) {
     let store = test_store();
     seed_genesis_baseline(&store);
     let server = MockServer::start().await;
     let hash = pending_tx_hash_hex();
 
-    // The standard pending fixture, its one output replaced by T2's
-    // `maria.cell` with the witness carrying maria's records.
-    let mut response = pending_transaction_rpc_response(&hash, "pending");
+    let mut response = pending_transaction_rpc_response(&hash, tx_status);
+    if tx_status == "committed" {
+        response["result"]["tx_status"]["block_number"] = serde_json::json!("0x1092");
+        response["result"]["tx_status"]["block_hash"] =
+            serde_json::json!(format!("0x{}", "33".repeat(32)));
+    }
     let tx = &mut response["result"]["transaction"];
-    tx["outputs"] = serde_json::json!([{
+    let account = serde_json::json!({
         "capacity": "0x59682f000",
         "lock": {
             "code_hash": format!("0x{T2_ACCOUNT_LOCK}"),
@@ -1280,15 +1288,16 @@ async fn test_pending_transaction_detail_decodes_dotcell_records_from_witness() 
             "hash_type": "type",
             "args": format!("0x{T2_NAMESPACE_ARGS}")
         }
-    }]);
-    tx["outputs_data"] = serde_json::json!([format!("0x{T2_OUT0_DATA}")]);
-    tx["witnesses"] = serde_json::json!([format!("0x{T2_WITNESS_0}")]);
+    });
+    tx["outputs"] = serde_json::json!([account, account]);
+    tx["outputs_data"] = serde_json::json!(["0xff", format!("0x{T2_OUT0_DATA}")]);
+    tx["witnesses"] = serde_json::json!(["0x", format!("0x{T2_WITNESS_0}")]);
     mount_transaction_rpc(&server, response).await;
-    mount_transaction_rpc(
-        &server,
-        funding_transaction_rpc_response("0x174876e974", &format!("0x{}", "33".repeat(20))),
-    )
-    .await;
+    let mut parent =
+        funding_transaction_rpc_response("0x174876e974", &format!("0x{}", "33".repeat(20)));
+    parent["result"]["transaction"]["outputs"][0]["type"] = account["type"].clone();
+    parent["result"]["transaction"]["outputs_data"][0] = serde_json::json!("0xff");
+    mount_transaction_rpc(&server, parent).await;
 
     let mut config = test_config(store);
     config.ckb_rpc_url = server.uri();
@@ -1297,12 +1306,24 @@ async fn test_pending_transaction_detail_decodes_dotcell_records_from_witness() 
 
     let (status, json) = get_json(&app, &format!("/transactions/{hash}/detail")).await;
     assert_eq!(status, StatusCode::OK, "got {json}");
-    assert_eq!(json["status"], "pending");
+    assert_eq!(json["status"], tx_status);
+    assert_eq!(json["inputs"][0]["capacity"], "100000000372");
+    assert_eq!(
+        json["inputs"][0]["type"]["codeHash"],
+        format!("0x{T2_ACCOUNT_TYPE}")
+    );
+    let outputs = json["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0]["capacity"], "24000000000");
+    assert_eq!(
+        outputs[0]["type"]["codeHash"],
+        format!("0x{T2_ACCOUNT_TYPE}")
+    );
     let names = json["dotcellNames"]
         .as_array()
         .unwrap_or_else(|| panic!("dotcellNames missing: {json}"));
     assert_eq!(names.len(), 1);
-    assert_eq!(names[0]["outputIndex"], 0);
+    assert_eq!(names[0]["outputIndex"], 1);
     assert_eq!(names[0]["name"], "maria.cell");
     let records = names[0]["records"].as_array().expect("records");
     assert_eq!(records.len(), 6);

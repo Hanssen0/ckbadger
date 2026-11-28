@@ -4529,6 +4529,12 @@ struct DotCellItemDetailApiRecord {
 }
 
 #[derive(serde::Deserialize)]
+struct DotCellApiErrorBody {
+    error: String,
+    message: String,
+}
+
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DotCellOutPointApiRecord {
     tx_hash: String,
@@ -4596,6 +4602,183 @@ fn parse_hex20(label: &str, value: &str) -> anyhow::Result<[u8; 20]> {
         .map_err(|_| anyhow::anyhow!("{label} is not 20 bytes: {value}"))
 }
 
+const DOTCELL_COLLECTION_NOT_FOUND_MESSAGE: &str = "Identity collection not found";
+const DOTCELL_RING_NOT_INDEXED_MESSAGE: &str = ".cell ring root not indexed on this network";
+const DOTCELL_RING_SPENT_ROOT_MESSAGE: &str = "no live decoded .cell ring root";
+const DOTCELL_RING_NOT_DEPLOYED: &str = "GET assets/identities/dotcell returned 404 (Identity collection not found) and GET assets/identities/dotcell/ring returned 404 (.cell ring root not indexed on this network): no .cell deployment on this network";
+
+/// Matches a structured `ApiError::not_found` response (`error == "not_found"`
+/// and an exact `message`). Any other 404 shape (wrong route, proxy error,
+/// empty or malformed body), 5xx, inconsistent-marker error, or transport
+/// failure remains `Error`.
+fn is_dotcell_api_not_found(body: &str, expected_message: &str) -> bool {
+    serde_json::from_str::<DotCellApiErrorBody>(body)
+        .is_ok_and(|parsed| parsed.error == "not_found" && parsed.message == expected_message)
+}
+
+const DOTCELL_LIVE_ITEMS_PATH: &str = "assets/identities/dotcell/items?limit=100&status=live";
+
+fn validate_dotcell_collection_counts(detail: &NftCollectionDetailApiRecord) -> anyhow::Result<()> {
+    if detail.total_count < 0 || detail.live_count < 0 || detail.holders_count < 0 {
+        anyhow::bail!(
+            "GET assets/identities/dotcell returned negative counts (totalCount={}, liveCount={}, holdersCount={})",
+            detail.total_count,
+            detail.live_count,
+            detail.holders_count
+        );
+    }
+    if detail.live_count > detail.total_count {
+        anyhow::bail!(
+            "GET assets/identities/dotcell returned liveCount={} > totalCount={}",
+            detail.live_count,
+            detail.total_count
+        );
+    }
+    Ok(())
+}
+
+/// Fetches the `.cell` collection aggregate and validates its counters,
+/// returning `Ok(None)` only for its canonical missing-aggregate 404. Wrong
+/// 404s, HTTP 5xx, malformed payloads, invalid counts, and transport failures
+/// remain errors.
+fn dotcell_collection_state(
+    ctx: &CheckContext,
+) -> anyhow::Result<Option<NftCollectionDetailApiRecord>> {
+    match api_get_outcome(ctx, "assets/identities/dotcell")? {
+        ApiGetOutcome::Found(detail) => {
+            validate_dotcell_collection_counts(&detail)?;
+            Ok(Some(detail))
+        }
+        ApiGetOutcome::NotFound { detail, body } => {
+            if is_dotcell_api_not_found(&body, DOTCELL_COLLECTION_NOT_FOUND_MESSAGE) {
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "GET assets/identities/dotcell returned {}{}",
+                    reqwest::StatusCode::NOT_FOUND,
+                    detail
+                );
+            }
+        }
+    }
+}
+
+/// Fetches the `.cell` collection aggregate (validated) and, when present,
+/// paginates its `status=live` listing.
+fn dotcell_live_items_state(
+    ctx: &CheckContext,
+) -> anyhow::Result<Option<Vec<DotCellItemListRecord>>> {
+    match dotcell_collection_state(ctx)? {
+        Some(_) => all_cursor_pages(ctx, DOTCELL_LIVE_ITEMS_PATH).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Parses a `status=live` listing into its set of live 20-byte ids plus any
+/// defects internal to the listing response (`isLive=false` rows or duplicate
+/// ids). Malformed hex ids surface as errors.
+fn parse_dotcell_live_list(
+    items: &[DotCellItemListRecord],
+) -> anyhow::Result<(std::collections::HashSet<[u8; 20]>, Vec<Finding>)> {
+    let mut live_ids = std::collections::HashSet::with_capacity(items.len());
+    let mut seen_ids = std::collections::HashSet::with_capacity(items.len());
+    let mut findings = Vec::new();
+    for item in items {
+        let item_id = parse_hex20("item id", &item.nft_id)?;
+        if !seen_ids.insert(item_id) {
+            findings.push(Finding {
+                entity: format!("dotcell_id=0x{}", hex::encode(item_id)),
+                details: vec!["duplicate live item id returned by collection listing".to_string()],
+            });
+        }
+        if item.is_live {
+            live_ids.insert(item_id);
+        } else {
+            findings.push(Finding {
+                entity: format!("dotcell_id=0x{}", hex::encode(item_id)),
+                details: vec!["the live listing returned a name with isLive=false".to_string()],
+            });
+        }
+    }
+    Ok((live_ids, findings))
+}
+
+fn recycled_detail_finding(item_id: [u8; 20]) -> Finding {
+    Finding {
+        entity: format!("dotcell_id=0x{}", hex::encode(item_id)),
+        details: vec![
+            "the live listing returned a name the detail route calls recycled".to_string(),
+        ],
+    }
+}
+
+fn confirm_dotcell_recycled_details(
+    ctx: &CheckContext,
+    items: &[DotCellItemListRecord],
+    recycled_details: &[(&DotCellItemListRecord, [u8; 20])],
+) -> anyhow::Result<CheckResult> {
+    let checked = items.len() as u64;
+    let (_, mut initial_defects) = parse_dotcell_live_list(items)?;
+    for &(item, item_id) in recycled_details {
+        let listed_id = parse_hex20("item id", &item.nft_id)?;
+        if item_id != listed_id {
+            initial_defects.push(Finding {
+                entity: format!("dotcell_id=0x{}", hex::encode(listed_id)),
+                details: vec![format!(
+                    "detail route returned identityId=0x{} for listed item 0x{}",
+                    hex::encode(item_id),
+                    hex::encode(listed_id)
+                )],
+            });
+        }
+    }
+    if !initial_defects.is_empty() {
+        for &(_, item_id) in recycled_details {
+            initial_defects.push(recycled_detail_finding(item_id));
+        }
+        return Ok(CheckResult::fail(checked, initial_defects));
+    }
+
+    let Some(recheck_items) = dotcell_live_items_state(ctx)? else {
+        return Ok(CheckResult::inconclusive(
+            "live .cell listing and ring observed live name(s) that the detail route reported as recycled, and rechecking GET assets/identities/dotcell returned 404 (Identity collection not found): API read view changed during check — rerun",
+        ));
+    };
+    let (recheck_live_ids, mut persistent_findings) = parse_dotcell_live_list(&recheck_items)?;
+    for &(item, item_id) in recycled_details {
+        if !recheck_live_ids.contains(&item_id) {
+            continue;
+        }
+        let detail: DotCellItemDetailApiRecord = api_get(
+            ctx,
+            &format!("assets/identities/dotcell/items/{}", item.nft_id),
+        )?;
+        let recheck_item_id = parse_hex20("item id", &detail.identity_id)?;
+        let _ = parse_hex20("next id", &detail.next_id)?;
+        if recheck_item_id != item_id {
+            persistent_findings.push(Finding {
+                entity: format!("dotcell_id=0x{}", hex::encode(item_id)),
+                details: vec![format!(
+                    "detail route returned identityId=0x{} for listed item 0x{}",
+                    hex::encode(recheck_item_id),
+                    hex::encode(item_id)
+                )],
+            });
+            continue;
+        }
+        if !detail.is_live {
+            persistent_findings.push(recycled_detail_finding(item_id));
+        }
+    }
+    if persistent_findings.is_empty() {
+        Ok(CheckResult::inconclusive(
+            "live .cell listing and ring observed live name(s) that the detail route reported as recycled, and rechecking the live listing/detail showed changed membership or liveness: API read view changed during check — rerun",
+        ))
+    } else {
+        Ok(CheckResult::fail(checked, persistent_findings))
+    }
+}
+
 pub struct DotCellRingIntegrity;
 
 impl Check for DotCellRingIntegrity {
@@ -4609,11 +4792,82 @@ impl Check for DotCellRingIntegrity {
         CheckTier::Sampling
     }
     fn run(&self, ctx: &CheckContext, progress: &ProgressReporter) -> anyhow::Result<CheckResult> {
-        let Some(items) = dotcell_live_items(ctx)? else {
-            return Ok(CheckResult::not_applicable(DOTCELL_NOT_DEPLOYED));
-        };
-        let ring: DotCellRingApiRecord = api_get(ctx, "assets/identities/dotcell/ring")?;
+        let items = dotcell_live_items_state(ctx)?;
 
+        let ring: DotCellRingApiRecord = match api_get_outcome(
+            ctx,
+            "assets/identities/dotcell/ring",
+        )? {
+            ApiGetOutcome::Found(ring) => ring,
+            ApiGetOutcome::NotFound { detail, body } => {
+                if is_dotcell_api_not_found(&body, DOTCELL_RING_SPENT_ROOT_MESSAGE) {
+                    return Ok(CheckResult::inconclusive(
+                        "GET assets/identities/dotcell/ring returned 404 (no live decoded .cell ring root): spent root has no decodable successor to walk",
+                    ));
+                }
+                if items.is_none()
+                    && is_dotcell_api_not_found(&body, DOTCELL_RING_NOT_INDEXED_MESSAGE)
+                {
+                    return Ok(CheckResult::not_applicable(DOTCELL_RING_NOT_DEPLOYED));
+                }
+                anyhow::bail!(
+                    "GET assets/identities/dotcell/ring returned {}{}",
+                    reqwest::StatusCode::NOT_FOUND,
+                    detail
+                );
+            }
+        };
+        if ring.live_count < 0 {
+            anyhow::bail!(
+                "GET assets/identities/dotcell/ring returned negative liveCount={}",
+                ring.live_count
+            );
+        }
+        let first_id = parse_hex20("ring first id", &ring.first_id)?;
+
+        // Each API request pins its own read view. When the initial view had no
+        // live names (either canonical missing-aggregate 404 while root-only or
+        // an existing aggregate with an empty live listing after recycling) and
+        // the ring GET then observes a coherent nonempty ring (`first_id != 0
+        // && live_count > 0`), recheck once to distinguish a changing view from
+        // a persistent discrepancy, without hiding internally contradictory
+        // ring fields.
+        if first_id != [0u8; 20] && ring.live_count > 0 {
+            match items.as_deref() {
+                None => {
+                    if dotcell_collection_state(ctx)?.is_some() {
+                        return Ok(CheckResult::inconclusive(
+                            "GET assets/identities/dotcell returned 404 (Identity collection not found), then GET assets/identities/dotcell/ring returned a nonempty ring, and rechecking GET assets/identities/dotcell found the collection: API read view changed during check — rerun",
+                        ));
+                    }
+                }
+                Some([]) => match dotcell_live_items_state(ctx)? {
+                    None => {
+                        return Ok(CheckResult::inconclusive(
+                            "GET assets/identities/dotcell was present with an empty live listing, then GET assets/identities/dotcell/ring returned a nonempty ring, and rechecking GET assets/identities/dotcell returned 404 (Identity collection not found): API read view changed during check — rerun",
+                        ));
+                    }
+                    Some(recheck_items) => {
+                        let (recheck_live_ids, recheck_findings) =
+                            parse_dotcell_live_list(&recheck_items)?;
+                        if !recheck_findings.is_empty() {
+                            return Ok(CheckResult::fail(0, recheck_findings));
+                        }
+                        if !recheck_live_ids.is_empty() {
+                            return Ok(CheckResult::inconclusive(
+                                "GET assets/identities/dotcell/items?limit=100&status=live was empty, then GET assets/identities/dotcell/ring returned a nonempty ring, and rechecking the live listing returned live names: API read view changed during check — rerun",
+                            ));
+                        }
+                    }
+                },
+                Some(_) => {}
+            }
+        }
+
+        let items = items.unwrap_or_default();
+
+        let mut findings = vec![];
+        let mut recycled_details: Vec<(&DotCellItemListRecord, [u8; 20])> = vec![];
         // The listing gives only ids; `next` comes from each item's detail.
         let mut next_by_id: std::collections::HashMap<[u8; 20], [u8; 20]> =
             std::collections::HashMap::new();
@@ -4622,16 +4876,24 @@ impl Check for DotCellRingIntegrity {
                 ctx,
                 &format!("assets/identities/dotcell/items/{}", item.nft_id),
             )?;
-            next_by_id.insert(
-                parse_hex20("item id", &detail.identity_id)?,
-                parse_hex20("next id", &detail.next_id)?,
-            );
+            let item_id = parse_hex20("item id", &detail.identity_id)?;
+            let next_id = parse_hex20("next id", &detail.next_id)?;
+            if !detail.is_live {
+                recycled_details.push((item, item_id));
+            }
+            if next_by_id.insert(item_id, next_id).is_some() {
+                findings.push(Finding {
+                    entity: format!("dotcell_id=0x{}", hex::encode(item_id)),
+                    details: vec![
+                        "duplicate live item id returned by collection listing".to_string()
+                    ],
+                });
+            }
             progress.inc(1);
         }
 
-        let mut findings = vec![];
         let mut visited: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
-        let mut current = parse_hex20("ring first id", &ring.first_id)?;
+        let mut current = first_id;
         let mut previous: Option<[u8; 20]> = None;
         while current != [0u8; 20] {
             if !visited.insert(current) {
@@ -4652,6 +4914,12 @@ impl Check for DotCellRingIntegrity {
                     });
                 }
             }
+            // Evidence limitation: 0.8.3 does not decode unsupported `.cell`
+            // layouts and exposes no API or chain outpoint association tying a
+            // specific missing `next_id` to an unindexed cell. A namespace-wide
+            // opaque cell count cannot correlate an unrelated opaque cell to
+            // `current`, so missing pointers remain a Fail rather than masking
+            // a broken ring link.
             let Some(next) = next_by_id.get(&current).copied() else {
                 findings.push(Finding {
                     entity: format!("dotcell_id=0x{}", hex::encode(current)),
@@ -4685,6 +4953,18 @@ impl Check for DotCellRingIntegrity {
         }
 
         let checked = items.len() as u64;
+        // If the listing and ring walk agreed with no other defects and only
+        // `!detail.is_live` fired, do one bounded confirmation of the current
+        // collection/live listing and only the implicated details still listed
+        // as live.
+        if findings.is_empty() && !recycled_details.is_empty() {
+            return confirm_dotcell_recycled_details(ctx, &items, &recycled_details);
+        }
+
+        for (_, item_id) in recycled_details {
+            findings.push(recycled_detail_finding(item_id));
+        }
+
         if findings.is_empty() {
             Ok(CheckResult::pass(checked))
         } else {
@@ -6749,21 +7029,37 @@ mod tests {
         }
     }
 
+    fn mount_dotcell_route_json(
+        runtime: &tokio::runtime::Runtime,
+        server: &MockServer,
+        route: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/{route}")))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(server)
+                .await;
+        });
+    }
+
     fn mount_dotcell_collection_status(
         runtime: &tokio::runtime::Runtime,
         server: &MockServer,
         status: u16,
     ) {
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/v1/assets/identities/dotcell"))
-                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
-                    "error": "status",
-                    "message": format!("fixture status {status}"),
-                })))
-                .mount(server)
-                .await;
-        });
+        mount_dotcell_route_json(
+            runtime,
+            server,
+            "assets/identities/dotcell",
+            status,
+            json!({
+                "error": "status",
+                "message": format!("fixture status {status}"),
+            }),
+        );
     }
 
     /// Answers the two node calls the records-parity check makes with the
@@ -6879,14 +7175,30 @@ mod tests {
         });
     }
 
-    /// A network with no `.cell` deployment answers 404 on the collection:
-    /// that, and only that, is "not applicable".
+    /// A network with no `.cell` deployment answers structured `not_found` 404s
+    /// on the collection and ring endpoints: that is "not applicable".
     #[test]
     fn dotcell_checks_are_not_applicable_on_a_404_collection() {
         for name in DOTCELL_CHECK_NAMES {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
             let server = runtime.block_on(MockServer::start());
-            mount_dotcell_collection_status(&runtime, &server, 404);
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell",
+                404,
+                json!({"error": "not_found", "message": "Identity collection not found"}),
+            );
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell/ring",
+                404,
+                json!({
+                    "error": "not_found",
+                    "message": ".cell ring root not indexed on this network",
+                }),
+            );
 
             let check = registered_check(name);
             let completed = execute_check(
@@ -7088,6 +7400,1080 @@ mod tests {
             } else {
                 assert!(completed.status_reason.unwrap().contains("identityId"));
             }
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_distinguishes_spent_root_from_errors() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        for (status, body, expected) in [
+            (
+                404,
+                json!({"error":"not_found", "message":"no live decoded .cell ring root"}),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                404,
+                json!({"error":"not_found", "message":".cell ring root not indexed on this network"}),
+                CheckStatus::Error,
+            ),
+            (
+                404,
+                json!({"error":"wrong_route", "message":"no live decoded .cell ring root"}),
+                CheckStatus::Error,
+            ),
+            (404, json!({}), CheckStatus::Error),
+            (
+                500,
+                json!({"error":"internal", "message":"inconsistent .cell ring root markers"}),
+                CheckStatus::Error,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            mount_dotcell_single_name(&runtime, &server);
+            runtime.block_on(
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell/ring"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+                    .with_priority(1)
+                    .mount(&server),
+            );
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "HTTP {status}: {body}");
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_errors_on_item_list_failure_despite_spent_root() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        for (status, body) in [
+            (
+                500,
+                json!({"error": "internal_error", "message": "items listing failed"}),
+            ),
+            (200, json!({"data": "not-an-array"})),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            mount_dotcell_single_name(&runtime, &server);
+            runtime.block_on(async {
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell/items"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell/ring"))
+                    .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                        "error": "not_found",
+                        "message": "no live decoded .cell ring root",
+                    })))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(
+                completed.status,
+                CheckStatus::Error,
+                "items HTTP {status}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_handles_absent_collection_ring_matrix() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let zero_id = format!("0x{}", "00".repeat(20));
+        let nonempty_id = format!("0x{}", "11".repeat(20));
+        let absent_collection = json!({
+            "error": "not_found",
+            "message": "Identity collection not found",
+        });
+
+        for (status, body, expected) in [
+            // Root-only ring: valid live empty root with no collection aggregate.
+            (
+                200,
+                json!({"firstId": zero_id, "liveCount": 0}),
+                CheckStatus::Pass,
+            ),
+            // Confirmed absent collection plus confirmed not-indexed ring.
+            (
+                404,
+                json!({
+                    "error": "not_found",
+                    "message": ".cell ring root not indexed on this network",
+                }),
+                CheckStatus::NotApplicable,
+            ),
+            // Confirmed spent root with no decodable successor, even without a collection.
+            (
+                404,
+                json!({
+                    "error": "not_found",
+                    "message": "no live decoded .cell ring root",
+                }),
+                CheckStatus::Inconclusive,
+            ),
+            // Nonempty or contradictory ring evidence alongside an absent collection.
+            (
+                200,
+                json!({"firstId": nonempty_id, "liveCount": 1}),
+                CheckStatus::Fail,
+            ),
+            (
+                200,
+                json!({"firstId": nonempty_id, "liveCount": 0}),
+                CheckStatus::Fail,
+            ),
+            (
+                200,
+                json!({"firstId": zero_id, "liveCount": 1}),
+                CheckStatus::Fail,
+            ),
+            // Invalid bodies, unexpected 404s, wrong markers, and 500s remain Error.
+            (
+                200,
+                json!({"firstId": zero_id, "liveCount": -1}),
+                CheckStatus::Error,
+            ),
+            (
+                200,
+                json!({"firstId": "0x1234", "liveCount": 0}),
+                CheckStatus::Error,
+            ),
+            (200, json!({}), CheckStatus::Error),
+            (
+                404,
+                json!({
+                    "error": "wrong_route",
+                    "message": ".cell ring root not indexed on this network",
+                }),
+                CheckStatus::Error,
+            ),
+            (
+                404,
+                json!({"error": "not_found", "message": "unexpected 404"}),
+                CheckStatus::Error,
+            ),
+            (404, json!({}), CheckStatus::Error),
+            (
+                500,
+                json!({
+                    "error": "internal_error",
+                    "message": "inconsistent .cell ring root markers",
+                }),
+                CheckStatus::Error,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell",
+                404,
+                absent_collection.clone(),
+            );
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell/ring",
+                status,
+                body.clone(),
+            );
+
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "ring HTTP {status}: {body}");
+            if expected == CheckStatus::Pass {
+                assert_eq!(completed.result.as_ref().unwrap().items_checked, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_rejects_unexpected_collection_and_transport_errors() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let ring_not_indexed = json!({
+            "error": "not_found",
+            "message": ".cell ring root not indexed on this network",
+        });
+
+        for (status, body) in [
+            (
+                404,
+                json!({
+                    "error": "wrong_route",
+                    "message": "Identity collection not found",
+                }),
+            ),
+            (
+                404,
+                json!({"error": "not_found", "message": "unexpected 404"}),
+            ),
+            (404, json!({})),
+            (200, json!({})),
+            (
+                500,
+                json!({"error": "internal_error", "message": "collection lookup failed"}),
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell",
+                status,
+                body.clone(),
+            );
+            mount_dotcell_route_json(
+                &runtime,
+                &server,
+                "assets/identities/dotcell/ring",
+                404,
+                ring_not_indexed.clone(),
+            );
+
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(
+                completed.status,
+                CheckStatus::Error,
+                "collection HTTP {status}: {body}"
+            );
+        }
+
+        // Non-JSON 404 bodies on either endpoint remain Error.
+        for non_json_on_ring in [false, true] {
+            let server = runtime.block_on(MockServer::start());
+            if non_json_on_ring {
+                mount_dotcell_route_json(
+                    &runtime,
+                    &server,
+                    "assets/identities/dotcell",
+                    404,
+                    json!({"error": "not_found", "message": "Identity collection not found"}),
+                );
+                runtime.block_on(
+                    Mock::given(method("GET"))
+                        .and(path("/api/v1/assets/identities/dotcell/ring"))
+                        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+                        .mount(&server),
+                );
+            } else {
+                runtime.block_on(
+                    Mock::given(method("GET"))
+                        .and(path("/api/v1/assets/identities/dotcell"))
+                        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+                        .mount(&server),
+                );
+                mount_dotcell_route_json(
+                    &runtime,
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    404,
+                    ring_not_indexed.clone(),
+                );
+            }
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(
+                completed.status,
+                CheckStatus::Error,
+                "non-JSON 404 (on_ring={non_json_on_ring})"
+            );
+        }
+
+        // Transport failure remains Error.
+        let closed_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let transport_ctx = CheckContext {
+            api_url: format!("http://{closed_addr}/api/v1"),
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+                .unwrap(),
+            ..test_ctx()
+        };
+        let completed = execute_check(check.as_ref(), &transport_ctx, &ProgressReporter::new(None));
+        assert_eq!(completed.status, CheckStatus::Error, "transport failure");
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_rechecks_absent_collection_only_for_coherent_nonempty_ring() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let zero_id = format!("0x{}", "00".repeat(20));
+        let nonempty_id = format!("0x{}", "11".repeat(20));
+        let absent = json!({"error": "not_found", "message": "Identity collection not found"});
+        let present = json!({
+            "collectionId": "dotcell",
+            "totalCount": 1,
+            "liveCount": 1,
+            "holdersCount": 1,
+        });
+        let nonempty_ring = json!({"firstId": nonempty_id, "liveCount": 1});
+
+        for (label, ring_body, recheck_status, recheck_body, recheck_calls, expected) in [
+            (
+                "first-registration transition",
+                nonempty_ring.clone(),
+                200u16,
+                Some(present.clone()),
+                1u64,
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "persistent absent collection",
+                nonempty_ring.clone(),
+                404,
+                Some(absent.clone()),
+                1,
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck wrong 404 error",
+                nonempty_ring.clone(),
+                404,
+                Some(json!({"error": "wrong_route", "message": "Identity collection not found"})),
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "recheck wrong 404 message",
+                nonempty_ring.clone(),
+                404,
+                Some(json!({"error": "not_found", "message": "unexpected 404"})),
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "recheck non-JSON 404",
+                nonempty_ring.clone(),
+                404,
+                None,
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "recheck HTTP 500",
+                nonempty_ring.clone(),
+                500,
+                Some(json!({"error": "internal_error", "message": "collection recheck failed"})),
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "recheck malformed 200",
+                nonempty_ring.clone(),
+                200,
+                Some(json!({})),
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "recheck negative collection count",
+                nonempty_ring.clone(),
+                200,
+                Some(json!({
+                    "collectionId": "dotcell",
+                    "totalCount": 1,
+                    "liveCount": -1,
+                    "holdersCount": 1,
+                })),
+                1,
+                CheckStatus::Error,
+            ),
+            (
+                "stable empty root-only ring",
+                json!({"firstId": zero_id, "liveCount": 0}),
+                200,
+                Some(present.clone()),
+                0,
+                CheckStatus::Pass,
+            ),
+            (
+                "contradictory nonzero firstId with liveCount 0",
+                json!({"firstId": nonempty_id, "liveCount": 0}),
+                200,
+                Some(present.clone()),
+                0,
+                CheckStatus::Fail,
+            ),
+            (
+                "contradictory zero firstId with liveCount 1",
+                json!({"firstId": zero_id, "liveCount": 1}),
+                200,
+                Some(present.clone()),
+                0,
+                CheckStatus::Fail,
+            ),
+            (
+                "invalid firstId with positive liveCount",
+                json!({"firstId": "0x1234", "liveCount": 1}),
+                200,
+                Some(present.clone()),
+                0,
+                CheckStatus::Error,
+            ),
+            (
+                "negative liveCount with nonzero firstId",
+                json!({"firstId": nonempty_id, "liveCount": -1}),
+                200,
+                Some(present.clone()),
+                0,
+                CheckStatus::Error,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            let recheck_resp = match recheck_body {
+                Some(body) => ResponseTemplate::new(recheck_status).set_body_json(body),
+                None => ResponseTemplate::new(recheck_status).set_body_string("not found"),
+            };
+            runtime.block_on(async {
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell"))
+                    .respond_with(ResponseTemplate::new(404).set_body_json(absent.clone()))
+                    .up_to_n_times(1)
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell"))
+                    .respond_with(recheck_resp)
+                    .with_priority(2)
+                    .expect(recheck_calls)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/assets/identities/dotcell/ring"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(ring_body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            });
+
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "{label}");
+            if expected == CheckStatus::Inconclusive {
+                let reason = completed.status_reason.unwrap_or_default();
+                assert!(reason.contains("read view changed"), "{label}: {reason}");
+            } else if label == "persistent absent collection" {
+                assert!(
+                    completed
+                        .result
+                        .unwrap()
+                        .findings
+                        .iter()
+                        .any(|finding| finding.entity.contains(&nonempty_id)),
+                    "{label}"
+                );
+            }
+            runtime.block_on(server.verify());
+        }
+    }
+
+    #[test]
+    fn unrelated_opaque_cell_cannot_explain_a_missing_dotcell_ring_target() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let server = runtime.block_on(MockServer::start());
+        mount_dotcell_single_name(&runtime, &server);
+        let missing_id = format!("0x{}", "12".repeat(20));
+        let opaque_tx = format!("0x{}", "ab".repeat(32));
+        runtime.block_on(async {
+            let route = |p: &str, body| Mock::given(method("GET"))
+                .and(path(format!("/api/v1/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .with_priority(1);
+            route("assets/identities/dotcell/ring", json!({"firstId":missing_id,"liveCount":1})).mount(&server).await;
+            route("cells/live", json!({"data":[{"txHash":opaque_tx,"outputIndex":0}],"nextCursor":null})).mount(&server).await;
+            route(&format!("cells/{opaque_tx}/0"), json!({"status":"live", "protocolScript":{"type":"dotcell-account"}, "data":"0xff"})).mount(&server).await;
+        });
+        let completed = execute_check(
+            registered_check("dotcell_ring_integrity").as_ref(),
+            &dotcell_ctx(&server),
+            &ProgressReporter::new(None),
+        );
+        assert_eq!(completed.status, CheckStatus::Fail);
+        assert!(completed
+            .result
+            .unwrap()
+            .findings
+            .iter()
+            .any(|finding| finding.entity.contains(&missing_id)));
+    }
+
+    fn dotcell_agg_json(total: i64, live: i64, holders: i64) -> serde_json::Value {
+        json!({
+            "collectionId": "dotcell",
+            "totalCount": total,
+            "liveCount": live,
+            "holdersCount": holders,
+        })
+    }
+
+    fn dotcell_item_json(id: &str, label: &str, is_live: bool) -> serde_json::Value {
+        json!({ "nftId": id, "name": format!("{label}.cell"), "isLive": is_live })
+    }
+
+    fn dotcell_detail_json(id: &str, label: &str, is_live: bool, next: &str) -> serde_json::Value {
+        json!({
+            "identityId": id,
+            "label": label,
+            "isLive": is_live,
+            "nextId": next,
+            "recordsHash": format!("0x{}", "00".repeat(32)),
+            "liveOutPoint": null,
+        })
+    }
+
+    async fn mount_dotcell_script(
+        server: &MockServer,
+        route: &str,
+        status_live: bool,
+        first: (u16, serde_json::Value, u64),
+        second: Option<(u16, serde_json::Value, u64)>,
+    ) {
+        let build = |resp: (u16, serde_json::Value, u64), priority: u8, once: bool| {
+            let mut mock = Mock::given(method("GET")).and(path(format!("/api/v1/{route}")));
+            if status_live {
+                mock = mock.and(query_param("status", "live"));
+            }
+            let mock = mock
+                .respond_with(ResponseTemplate::new(resp.0).set_body_json(resp.1))
+                .with_priority(priority)
+                .expect(resp.2);
+            if once {
+                mock.up_to_n_times(1)
+            } else {
+                mock
+            }
+        };
+        build(first, 1, second.is_some()).mount(server).await;
+        if let Some(second) = second {
+            build(second, 2, false).mount(server).await;
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_validates_collection_counts_on_initial_and_recheck() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let zero_id = format!("0x{}", "00".repeat(20));
+        let id_a = format!("0x{}", "11".repeat(20));
+        let absent = json!({"error": "not_found", "message": "Identity collection not found"});
+        let empty_page = json!({"data": [], "nextCursor": null});
+
+        for (label, total, live, holders, valid) in [
+            ("zero counts", 0, 0, 0, true),
+            ("recycled to zero live", 2, 0, 0, true),
+            ("holders above live", 1, 0, 2, true),
+            ("negative totalCount", -1, 0, 0, false),
+            ("negative liveCount", 1, -1, 0, false),
+            ("negative holdersCount", 1, 0, -1, false),
+            ("liveCount exceeds totalCount", 1, 2, 1, false),
+        ] {
+            let agg = dotcell_agg_json(total, live, holders);
+
+            // Initial read: valid counts pass an empty ring; invalid counts error before /items or /ring.
+            let server = runtime.block_on(MockServer::start());
+            let downstream = u64::from(valid);
+            runtime.block_on(async {
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell",
+                    false,
+                    (200, agg.clone(), 1),
+                    None,
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/items",
+                    true,
+                    (200, empty_page.clone(), downstream),
+                    None,
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    false,
+                    (200, json!({"firstId": zero_id, "liveCount": 0}), downstream),
+                    None,
+                )
+                .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(
+                completed.status,
+                if valid {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Error
+                },
+                "initial {label}"
+            );
+            runtime.block_on(server.verify());
+
+            // Repeat read (absent -> present recheck): valid counts -> Inconclusive; invalid -> Error.
+            let server = runtime.block_on(MockServer::start());
+            runtime.block_on(async {
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell",
+                    false,
+                    (404, absent.clone(), 1),
+                    Some((200, agg, 1)),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    false,
+                    (200, json!({"firstId": id_a, "liveCount": 1}), 1),
+                    None,
+                )
+                .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(
+                completed.status,
+                if valid {
+                    CheckStatus::Inconclusive
+                } else {
+                    CheckStatus::Error
+                },
+                "recheck {label}"
+            );
+            runtime.block_on(server.verify());
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_rechecks_empty_live_list_transitions_and_errors() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let zero_id = format!("0x{}", "00".repeat(20));
+        let id_a = format!("0x{}", "11".repeat(20));
+        let empty_agg = dotcell_agg_json(1, 0, 0);
+        let live_agg = dotcell_agg_json(2, 1, 1);
+        let absent = json!({"error": "not_found", "message": "Identity collection not found"});
+        let empty_page = json!({"data": [], "nextCursor": null});
+        let live_page =
+            json!({"data": [dotcell_item_json(&id_a, "alpha", true)], "nextCursor": null});
+        let nonempty_ring = json!({"firstId": id_a, "liveCount": 1});
+        let err500 = json!({"error": "internal_error", "message": "boom"});
+
+        for (label, ring, recheck_col, recheck_items, expected) in [
+            (
+                "registration after recycle",
+                (200u16, nonempty_ring.clone()),
+                (200u16, live_agg.clone(), 1u64),
+                (200u16, live_page.clone(), 1u64),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "canonical disappearance",
+                (200, nonempty_ring.clone()),
+                (404, absent.clone(), 1),
+                (200, empty_page.clone(), 0),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "persistent empty list",
+                (200, nonempty_ring.clone()),
+                (200, empty_agg.clone(), 1),
+                (200, empty_page.clone(), 1),
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck live list with isLive=false",
+                (200, nonempty_ring.clone()),
+                (200, live_agg.clone(), 1),
+                (
+                    200,
+                    json!({"data": [dotcell_item_json(&id_a, "alpha", false)], "nextCursor": null}),
+                    1,
+                ),
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck live list duplicate id",
+                (200, nonempty_ring.clone()),
+                (200, live_agg.clone(), 1),
+                (
+                    200,
+                    json!({"data": [dotcell_item_json(&id_a, "alpha", true), dotcell_item_json(&id_a, "alpha", true)], "nextCursor": null}),
+                    1,
+                ),
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck collection HTTP 500",
+                (200, nonempty_ring.clone()),
+                (500, err500.clone(), 1),
+                (200, live_page.clone(), 0),
+                CheckStatus::Error,
+            ),
+            (
+                "recheck items HTTP 500",
+                (200, nonempty_ring.clone()),
+                (200, live_agg.clone(), 1),
+                (500, err500.clone(), 1),
+                CheckStatus::Error,
+            ),
+            (
+                "stable empty ring skips recheck",
+                (200, json!({"firstId": zero_id, "liveCount": 0})),
+                (200, live_agg.clone(), 0),
+                (200, live_page.clone(), 0),
+                CheckStatus::Pass,
+            ),
+            (
+                "contradictory ring skips recheck",
+                (200, json!({"firstId": id_a, "liveCount": 0})),
+                (200, live_agg.clone(), 0),
+                (200, live_page.clone(), 0),
+                CheckStatus::Fail,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            runtime.block_on(async {
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell",
+                    false,
+                    (200, empty_agg.clone(), 1),
+                    Some(recheck_col),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/items",
+                    true,
+                    (200, empty_page.clone(), 1),
+                    Some(recheck_items),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    false,
+                    (ring.0, ring.1, 1),
+                    None,
+                )
+                .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "{label}");
+            if label == "persistent empty list" {
+                assert!(
+                    completed
+                        .result
+                        .unwrap()
+                        .findings
+                        .iter()
+                        .any(|f| f.entity.contains(&id_a)),
+                    "{label}"
+                );
+            }
+            runtime.block_on(server.verify());
+        }
+    }
+
+    #[test]
+    fn dotcell_ring_integrity_confirms_recycled_detail_contradictions() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let check = registered_check("dotcell_ring_integrity");
+        let zero_id = format!("0x{}", "00".repeat(20));
+        let id_a = format!("0x{}", "11".repeat(20));
+        let id_b = format!("0x{}", "22".repeat(20));
+        let id_c = format!("0x{}", "33".repeat(20));
+        let absent = json!({"error": "not_found", "message": "Identity collection not found"});
+        let err500 = json!({"error": "internal_error", "message": "boom"});
+        let item_a = dotcell_item_json(&id_a, "alpha", true);
+        let item_b = dotcell_item_json(&id_b, "beta", true);
+        let item_c = dotcell_item_json(&id_c, "gamma", true);
+        let det_a_recycled = dotcell_detail_json(&id_a, "alpha", false, &zero_id);
+        let det_a_live = dotcell_detail_json(&id_a, "alpha", true, &zero_id);
+
+        // Single implicated name: transitions, persistent contradictions, single-response defects, and errors.
+        for (label, ring_live, recheck_col, recheck_items, recheck_det, expected) in [
+            (
+                "normal recycle",
+                1i64,
+                (200u16, dotcell_agg_json(1, 0, 0), 1u64),
+                (200u16, json!({"data": [], "nextCursor": null}), 1u64),
+                (200u16, det_a_recycled.clone(), 0u64),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "recycle then reactivation",
+                1,
+                (200, dotcell_agg_json(1, 1, 1), 1),
+                (
+                    200,
+                    json!({"data": [item_a.clone()], "nextCursor": null}),
+                    1,
+                ),
+                (200, det_a_live.clone(), 1),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "canonical disappearance",
+                1,
+                (404, absent.clone(), 1),
+                (200, json!({"data": [], "nextCursor": null}), 0),
+                (200, det_a_recycled.clone(), 0),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "persistent disagreement",
+                1,
+                (200, dotcell_agg_json(1, 1, 1), 1),
+                (
+                    200,
+                    json!({"data": [item_a.clone()], "nextCursor": null}),
+                    1,
+                ),
+                (200, det_a_recycled.clone(), 1),
+                CheckStatus::Fail,
+            ),
+            (
+                "unrelated change plus persistent disagreement",
+                1,
+                (200, dotcell_agg_json(2, 2, 2), 1),
+                (
+                    200,
+                    json!({"data": [item_a.clone(), item_c.clone()], "nextCursor": null}),
+                    1,
+                ),
+                (200, det_a_recycled.clone(), 1),
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck detail identityId mismatch",
+                1,
+                (200, dotcell_agg_json(1, 1, 1), 1),
+                (
+                    200,
+                    json!({"data": [item_a.clone()], "nextCursor": null}),
+                    1,
+                ),
+                (200, dotcell_detail_json(&id_c, "gamma", true, &zero_id), 1),
+                CheckStatus::Fail,
+            ),
+            (
+                "recheck detail HTTP 500",
+                1,
+                (200, dotcell_agg_json(1, 1, 1), 1),
+                (
+                    200,
+                    json!({"data": [item_a.clone()], "nextCursor": null}),
+                    1,
+                ),
+                (500, err500.clone(), 1),
+                CheckStatus::Error,
+            ),
+            (
+                "recheck items HTTP 500",
+                1,
+                (200, dotcell_agg_json(1, 1, 1), 1),
+                (500, err500.clone(), 1),
+                (200, det_a_live.clone(), 0),
+                CheckStatus::Error,
+            ),
+            (
+                "co-occurring walk defect skips confirmation",
+                2,
+                (200, dotcell_agg_json(1, 0, 0), 0),
+                (200, json!({"data": [], "nextCursor": null}), 0),
+                (200, det_a_live.clone(), 0),
+                CheckStatus::Fail,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            runtime.block_on(async {
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell",
+                    false,
+                    (200, dotcell_agg_json(1, 1, 1), 1),
+                    Some(recheck_col),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/items",
+                    true,
+                    (
+                        200,
+                        json!({"data": [item_a.clone()], "nextCursor": null}),
+                        1,
+                    ),
+                    Some(recheck_items),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    false,
+                    (200, json!({"firstId": id_a, "liveCount": ring_live}), 1),
+                    None,
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    &format!("assets/identities/dotcell/items/{id_a}"),
+                    false,
+                    (200, det_a_recycled.clone(), 1),
+                    Some(recheck_det),
+                )
+                .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "single: {label}");
+            runtime.block_on(server.verify());
+        }
+
+        // Multiple implicated names share a single collection/list reread and never mask a persistent defect.
+        for (label, recheck_items, recheck_a, recheck_b, expected) in [
+            (
+                "both recycled",
+                vec![],
+                (false, 0u64),
+                (false, 0u64),
+                CheckStatus::Inconclusive,
+            ),
+            (
+                "first recycled, second persistent",
+                vec![item_b.clone()],
+                (false, 0),
+                (false, 1),
+                CheckStatus::Fail,
+            ),
+            (
+                "first reactivated, second persistent",
+                vec![item_a.clone(), item_b.clone()],
+                (true, 1),
+                (false, 1),
+                CheckStatus::Fail,
+            ),
+        ] {
+            let server = runtime.block_on(MockServer::start());
+            let live = recheck_items.len() as i64;
+            runtime.block_on(async {
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell",
+                    false,
+                    (200, dotcell_agg_json(2, 2, 2), 1),
+                    Some((200, dotcell_agg_json(2, live, live), 1)),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/items",
+                    true,
+                    (
+                        200,
+                        json!({"data": [item_a.clone(), item_b.clone()], "nextCursor": null}),
+                        1,
+                    ),
+                    Some((200, json!({"data": recheck_items, "nextCursor": null}), 1)),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    "assets/identities/dotcell/ring",
+                    false,
+                    (200, json!({"firstId": id_a, "liveCount": 2}), 1),
+                    None,
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    &format!("assets/identities/dotcell/items/{id_a}"),
+                    false,
+                    (200, dotcell_detail_json(&id_a, "alpha", false, &id_b), 1),
+                    Some((
+                        200,
+                        dotcell_detail_json(&id_a, "alpha", recheck_a.0, &id_b),
+                        recheck_a.1,
+                    )),
+                )
+                .await;
+                mount_dotcell_script(
+                    &server,
+                    &format!("assets/identities/dotcell/items/{id_b}"),
+                    false,
+                    (200, dotcell_detail_json(&id_b, "beta", false, &zero_id), 1),
+                    Some((
+                        200,
+                        dotcell_detail_json(&id_b, "beta", recheck_b.0, &zero_id),
+                        recheck_b.1,
+                    )),
+                )
+                .await;
+            });
+            let completed = execute_check(
+                check.as_ref(),
+                &dotcell_ctx(&server),
+                &ProgressReporter::new(None),
+            );
+            assert_eq!(completed.status, expected, "multi: {label}");
+            if expected == CheckStatus::Fail {
+                let findings = completed.result.unwrap().findings;
+                assert_eq!(findings.len(), 1, "multi: {label}: {findings:?}");
+                assert!(findings[0].entity.contains(&id_b), "multi: {label}");
+            }
+            runtime.block_on(server.verify());
         }
     }
 }

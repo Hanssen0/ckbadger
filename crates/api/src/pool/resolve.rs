@@ -42,8 +42,8 @@ use std::future::Future;
 use ckb_store_reader::RpcTransactionView;
 use ckbadger_indexer::db::{InputCellView, OutputCellView, TxView};
 use ckbadger_indexer::parser::dao::{DaoParser, DaoState};
+use ckbadger_indexer::parser::dotcell::{DotCellParser, DotCellRead};
 use ckbadger_indexer::parser::udt::UdtParser;
-use ckbadger_indexer::parser::DotCellParser;
 use ckbadger_store::types::DotCellNameData;
 use futures::StreamExt;
 
@@ -99,8 +99,7 @@ pub struct ResolvedCell {
     /// (code_hash, hash_type), then parse; a short payload yields no amount
     /// rather than a zero.
     pub udt_amount: Option<u128>,
-    /// The `.cell` name this cell carries, when its type script is the Cells
-    /// Account script.
+    /// The layout read for a Cells Account output, including an unindexed parent.
     ///
     /// A `.cell` name's ownership lives in the cell's DATA, and the classifier
     /// learns a consumed name's previous state only from
@@ -108,7 +107,7 @@ pub struct ResolvedCell {
     /// output, data included, so it parses it here with the SAME parser the
     /// indexer uses — leaving it empty would make every touch of an existing
     /// name read as a brand-new registration.
-    pub dotcell: Option<DotCellNameData>,
+    pub dotcell: Option<DotCellRead<DotCellNameData>>,
     /// For a Nervos DAO withdraw-request cell spent as an input: the exact
     /// compensation completing its withdrawal pays, from the deposit and
     /// request headers' accumulated rates and THIS cell's occupied capacity
@@ -141,12 +140,10 @@ impl ResolvedCell {
                     let script_hash = compute_script_hash(&code_hash, hash_type as u8, &args);
                     let udt_amount = UdtParser::is_udt_code_hash_bytes(&code_hash, hash_type)
                         .and_then(|_| UdtParser::parse_amount(&data));
-                    // A Cells Account cell whose data does not decode is not a
-                    // cell to interpret loosely: say so rather than report the
-                    // transaction as if the name were absent.
+                    // Preserve an unindexed parent for the shared activity detector.
                     let dotcell = if DotCellParser::is_account_type_script(&code_hash) {
                         Some(
-                            DotCellParser::parse_name_data(&data)
+                            DotCellParser::read_name_data(&data)
                                 .map_err(|e| format!("pool .cell name cell: {e}"))?,
                         )
                     } else {
@@ -285,10 +282,7 @@ impl ResolvedPoolTx {
                 bit_cell_identity_id: None,
                 // `.cell` is the exception: the classifier reads a consumed
                 // name's previous state from this field, never from the data.
-                dotcell: cell
-                    .dotcell
-                    .as_ref()
-                    .map(ckbadger_indexer::parser::dotcell::DotCellRead::Item),
+                dotcell: cell.dotcell.as_ref().map(DotCellRead::as_ref),
                 data: &cell.data,
                 // Same two fields live sync fills from its DAO map: the
                 // resolver priced every spent withdraw-request cell, so the

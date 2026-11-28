@@ -271,41 +271,27 @@ async fn test_cell_detail_exposes_registry_protocol_slugs() {
 /// registered on mainnet (tx 0xf20d2e96…663e output 1), 105 bytes.
 const DOTCELL_SUPPORT_DATA: &str = "0372ad09e23868d88a8e85519ebeee56f60eda6c5a564e8a369a4c9d8ea29087e265b5fe7e7070b506f69bd8cabf9e4272111066455e00926c0057d926a44d83fc13b21ce037b1e31f4223e3c86757d926a44d83fc13b21ce037b1e31f4223e3c867737570706f7274";
 
-/// Seed a CKB-node-format chain holding one transaction whose output 0 is a
-/// mainnet `.cell` name cell with `data`, plus the matching live-cell row in
-/// the domain store. Returns the router and the transaction hash.
+/// Seed the node's live-cell data entry and the matching indexed metadata.
 async fn dotcell_name_cell_app(data: Vec<u8>) -> (axum::Router, [u8; 32], TestCkbChain) {
-    use ckb_types::bytes::Bytes;
-    use ckb_types::core::{Capacity, ScriptHashType, TransactionBuilder};
-    use ckb_types::packed;
-    use ckb_types::prelude::*;
+    use ckb_types::{bytes::Bytes, packed, prelude::*};
 
-    let script = |code_hash: &str, args: &[u8]| {
-        let code_hash: [u8; 32] = hex::decode(code_hash).unwrap().try_into().unwrap();
-        packed::Script::new_builder()
-            .code_hash(packed::Byte32::new(code_hash))
-            .hash_type(ScriptHashType::Type.into())
-            .args(Bytes::from(args.to_vec()).pack())
-            .build()
-    };
-    let namespace = hex::decode(DOTCELL_NAMESPACE_ARGS_MAINNET).unwrap();
-    let output = packed::CellOutput::new_builder()
-        .capacity(Capacity::shannons(240_00000000).pack())
-        .lock(script(DOTCELL_ACCOUNT_LOCK_MAINNET, &[]))
-        .type_(Some(script(DOTCELL_ACCOUNT_TYPE_MAINNET, &namespace)).pack())
-        .build();
+    let tx_hash = [0xc1; 32];
     let data_size = data.len() as i32;
-    let tx = TransactionBuilder::default()
-        .output(output)
-        .output_data(Bytes::from(data).pack())
-        .build();
-    let tx_hash: [u8; 32] = tx.hash().unpack();
-    let block = ckb_types::core::BlockBuilder::default()
-        .number(123u64.pack())
-        .epoch(ckb_types::core::EpochNumberWithFraction::new(1, 0, 1800).pack())
-        .transaction(tx)
-        .build();
-    let chain = seed_ckb_chain(&[block]);
+    let chain = seed_ckb_chain(&[]);
+    {
+        let options = Options::default();
+        let cfs = DB::list_cf(&options, &chain.path).unwrap();
+        let db = DB::open_cf(&options, &chain.path, cfs).unwrap();
+        let cells = db.cf_handle("12").unwrap(); // CKB COLUMN_CELL_DATA
+        let key = [tx_hash.as_slice(), &0u32.to_le_bytes()].concat();
+        let data = Bytes::from(data).pack();
+        let entry = packed::CellDataEntry::new_builder()
+            .output_data_hash(data.calc_raw_data_hash())
+            .output_data(data)
+            .build();
+        db.put_cf(&cells, key, entry.as_slice()).unwrap();
+        db.flush_cf(&cells).unwrap();
+    }
 
     let store = test_store();
     let mut batch = StoreBatch::new(store.as_ref());
@@ -352,9 +338,31 @@ async fn test_cell_detail_decodes_dotcell_name_from_ckb_store() {
     assert_eq!(json["protocolScript"]["type"], "dotcell-account");
 }
 
-/// A Cells Account cell whose bytes do not decode cannot have been stored by
-/// the indexer; the cell page reports it with the outpoint instead of
-/// rendering a guess.
+#[tokio::test]
+async fn test_cell_detail_keeps_unsupported_dotcell_layout_as_raw_data() {
+    let (app, hash, _chain) = dotcell_name_cell_app(vec![0xff]).await;
+    let (status, json) = get_json(&app, &format!("/cells/0x{}/0", hex::encode(hash))).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "live");
+    assert_eq!(json["data"], "0xff");
+    assert_eq!(json["dataSize"], 1);
+    assert_eq!(json["protocolScript"]["type"], "dotcell-account");
+    let analysis = &json["dataAnalysis"];
+    assert!(analysis.get("deterministic").is_none());
+    let hint = analysis["heuristicGuesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hint| hint["kind"] == "script_hint")
+        .unwrap();
+    assert_eq!(
+        hint["reason"],
+        "Cells Account type script with unsupported layout byte 255"
+    );
+    assert!(hint.get("humanValue").is_none());
+}
+
+/// A truncated supported layout still reports the failing outpoint.
 #[tokio::test]
 async fn test_cell_detail_undecodable_dotcell_data_is_an_internal_error() {
     let mut data = hex::decode(DOTCELL_SUPPORT_DATA).unwrap();
