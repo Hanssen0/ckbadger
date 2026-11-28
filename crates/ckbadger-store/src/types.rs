@@ -1116,6 +1116,17 @@ pub struct DotCellRingRoot {
     pub created_at_block: i64,
 }
 
+/// The recognized `.cell` v3 namespace persisted for this store.
+///
+/// Stored in `CF_STATS_SPORE` under `keys::encode_dotcell_namespace_key()` so
+/// live sync retains the namespace across batches and restarts even when no
+/// decoded ring root has been indexed yet, matching bulk build while keeping
+/// the 0.8.3 column-family layout unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DotCellNamespace {
+    pub namespace_args: [u8; 20],
+}
+
 /// Pre-aggregated cluster (DOB collection) data, maintained inline by the indexer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterAggregate {

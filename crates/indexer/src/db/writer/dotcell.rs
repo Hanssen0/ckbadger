@@ -10,11 +10,12 @@ use anyhow::{anyhow, bail, Result};
 use ckbadger_store::batch::StoreBatch;
 use ckbadger_store::keys;
 use ckbadger_store::store::{
-    CF_DOTCELL_NAME_BY_OWNER, CF_DOTCELL_RING, CF_IDENTITY_DATA, CF_STATS_SPORE,
+    CF_DOTCELL_NAME_BY_OWNER, CF_DOTCELL_RING, CF_IDENTITY_BY_COLLECTION, CF_IDENTITY_DATA,
+    CF_STATS_SPORE,
 };
 use ckbadger_store::types::{
-    derive_dotcell_id, DotCellNameData, DotCellRecord, DotCellRingRoot, IdentityEntry,
-    IdentityExtra, IdentityStandard, DOTCELL_SENTINEL_COLLECTION,
+    derive_dotcell_id, DotCellNameData, DotCellNamespace, DotCellRecord, DotCellRingRoot,
+    IdentityEntry, IdentityExtra, IdentityStandard, DOTCELL_SENTINEL_COLLECTION,
 };
 
 use crate::parser::dotcell::DotCellRead;
@@ -98,9 +99,16 @@ impl BatchWriter {
     /// A network runs exactly one `.cell` namespace. Two would make bare
     /// 20-byte ids collide on identical labels, so a second one stops the sync
     /// rather than silently merging two name spaces into one collection.
+    ///
+    /// Persists the recognized v3 namespace atomically with the same per-block
+    /// undo machinery as the observations across fresh stores, legacy ring
+    /// rows, and old name-only DBs. Never called for opaque/unindexed `.cell`
+    /// cells.
     fn guard_dotcell_namespace(
         &self,
         namespace_args: &[u8; 20],
+        block_number: i64,
+        batch: &mut StoreBatch,
         state: &mut SporeBatchState,
     ) -> Result<()> {
         for known in state.dotcell_known_namespaces(self.store.as_ref())? {
@@ -113,7 +121,51 @@ impl BatchWriter {
                 );
             }
         }
-        state.remember_dotcell_namespace(*namespace_args);
+        if state.dotcell_persisted_namespace().is_none() {
+            let record = DotCellNamespace {
+                namespace_args: *namespace_args,
+            };
+            let key = keys::encode_dotcell_namespace_key();
+            self.record_object_undo(
+                batch,
+                block_number,
+                CF_STATS_SPORE,
+                &key,
+                None,
+                &state.undo_seq_by_block,
+            );
+            batch.put_dotcell_namespace(&record);
+            state.record_persisted_dotcell_namespace(record);
+        }
+        Ok(())
+    }
+
+    /// Write a `.cell` collection membership row (`CF_IDENTITY_BY_COLLECTION`)
+    /// with its undo pre-image so rollback never leaves a dangling membership
+    /// key whose `CF_IDENTITY_DATA` row has been undone.
+    fn put_dotcell_collection_membership(
+        &self,
+        collection_id: &[u8],
+        name_id: &[u8; 20],
+        block_number: i64,
+        batch: &mut StoreBatch,
+        state: &SporeBatchState,
+    ) -> Result<()> {
+        if !self.store.is_bulk_sync_mode() {
+            let key = keys::encode_identity_by_collection_key(collection_id, name_id);
+            let previous = self
+                .store
+                .get_cf(self.store.cf_identity_by_collection(), &key)?;
+            self.record_object_undo(
+                batch,
+                block_number,
+                CF_IDENTITY_BY_COLLECTION,
+                &key,
+                previous,
+                &state.undo_seq_by_block,
+            );
+        }
+        batch.put_identity_by_collection(collection_id, name_id);
         Ok(())
     }
 
@@ -131,7 +183,7 @@ impl BatchWriter {
         batch: &mut StoreBatch,
         state: &mut SporeBatchState,
     ) -> Result<()> {
-        self.guard_dotcell_namespace(namespace_args, state)?;
+        self.guard_dotcell_namespace(namespace_args, block_number, batch, state)?;
         super::ensure_outpoint_indexable_item_id(&name.id, "dotcell", tx_hash, output_index)?;
 
         if name.is_root() {
@@ -272,7 +324,13 @@ impl BatchWriter {
         // collection index, keyed by the parent's padded id.
         if existing.is_none() {
             if let Some(parent) = name.parent_id() {
-                batch.put_identity_by_collection(&keys::pad_id_32(&parent), &name.id);
+                self.put_dotcell_collection_membership(
+                    &keys::pad_id_32(&parent),
+                    &name.id,
+                    block_number,
+                    batch,
+                    state,
+                )?;
             }
         }
 
@@ -283,7 +341,13 @@ impl BatchWriter {
             agg.name = Some(".cell".to_string());
         }
         if existing.is_none() {
-            batch.put_identity_by_collection(collection, &name.id);
+            self.put_dotcell_collection_membership(
+                collection,
+                &name.id,
+                block_number,
+                batch,
+                state,
+            )?;
             agg.total_count = checked_inc(agg.total_count, "dotcell total_count", &name.id)?;
             agg.live_count = checked_inc(agg.live_count, "dotcell live_count", &name.id)?;
         } else if !was_live {
@@ -977,6 +1041,7 @@ mod tests {
         let cfs = undo_cfs(&store);
         for expected in [
             ckbadger_store::CF_IDENTITY_DATA,
+            CF_IDENTITY_BY_COLLECTION,
             ckbadger_store::CF_DOTCELL_NAME_BY_OWNER,
             ckbadger_store::CF_DOTCELL_RING,
         ] {
@@ -1063,6 +1128,510 @@ mod tests {
                 .unwrap(),
             vec![sub.id.to_vec()],
             "and it is still a name of the .cell collection"
+        );
+    }
+
+    #[test]
+    fn sub_name_rollback_cleans_parent_and_collection_membership() {
+        let (store, writer, _dir) = writer_for_test();
+        let parent = DotCellParser::parse_name_data(&parse_hex_to_bytes(
+            fixture::T3_REGISTER_SUBNAME.inputs[0].data,
+        ))
+        .unwrap();
+        let sub =
+            DotCellParser::parse_name_data(&parse_hex_to_bytes(fixture::T3_OUT1_DATA)).unwrap();
+        let parent_id = sub.parent_id().expect("sub-name has a parent");
+        assert_eq!(parent_id, parent.id);
+        let namespace: [u8; 20] = parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET)
+            .try_into()
+            .unwrap();
+        let expected_ns = DotCellNamespace {
+            namespace_args: namespace,
+        };
+
+        // Block 22_367_970: register the parent name.
+        let mut batch = StoreBatch::new(writer.store());
+        let mut state = new_state(&writer);
+        writer
+            .insert_dotcell_name(
+                &parent,
+                &[],
+                &namespace,
+                &[0xA1; 32],
+                0,
+                22_367_970,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+
+        // Block 22_367_979: register the sub-name under that parent.
+        let mut batch = StoreBatch::new(writer.store());
+        let mut state = new_state(&writer);
+        writer
+            .insert_dotcell_name(
+                &sub,
+                &[],
+                &namespace,
+                &[0xA2; 32],
+                1,
+                22_367_979,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(
+            store
+                .list_identity_ids_by_collection(&parent_id, None, 10)
+                .unwrap(),
+            vec![sub.id.to_vec()]
+        );
+        let mut all_members = store
+            .list_identity_ids_by_collection(&DOTCELL_SENTINEL_COLLECTION, None, 10)
+            .unwrap();
+        all_members.sort();
+        let mut expected_members = vec![parent.id.to_vec(), sub.id.to_vec()];
+        expected_members.sort();
+        assert_eq!(all_members, expected_members);
+
+        // Rollback #1 to 22_367_978 removes the sub-name from identity_data,
+        // parent membership, and .cell collection membership, while keeping
+        // the parent intact.
+        let append_dir = tempfile::tempdir().unwrap();
+        let append = CkbadgerStore::open_append_only(append_dir.path()).unwrap();
+        store.rollback_via_undo_log(&append, 22_367_978).unwrap();
+        assert!(store.get_identity(&sub.id).unwrap().is_none());
+        assert!(store.get_identity(&parent.id).unwrap().is_some());
+        assert!(store
+            .list_identity_ids_by_collection(&parent_id, None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_identity_ids_by_collection(&DOTCELL_SENTINEL_COLLECTION, None, 10)
+                .unwrap(),
+            vec![parent.id.to_vec()]
+        );
+        assert_eq!(
+            store.resolve_dotcell_namespace().unwrap(),
+            Some(expected_ns)
+        );
+
+        // Rollback #2 to 22_367_969 removes the parent membership too, leaving
+        // no dangling .cell collection members and no resolved namespace.
+        store.rollback_via_undo_log(&append, 22_367_969).unwrap();
+        assert!(store.get_identity(&parent.id).unwrap().is_none());
+        assert!(store
+            .list_identity_ids_by_collection(&parent_id, None, 10)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_identity_ids_by_collection(&DOTCELL_SENTINEL_COLLECTION, None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+        assert_eq!(store.resolve_dotcell_namespace().unwrap(), None);
+    }
+
+    #[test]
+    fn name_only_v3_namespace_persists_across_batches_reopen_and_two_rollbacks() {
+        let (store, writer, dir) = writer_for_test();
+        let name = support_name();
+        let namespace = mainnet_namespace();
+        let expected_ns = DotCellNamespace {
+            namespace_args: namespace,
+        };
+        let tx_hash = parse_hex_to_bytes(fixture::M2_REGISTER_SUPPORT.tx_hash);
+
+        // Batch 1: name-only v3 observation (no ring root) at block 100.
+        let mut batch = StoreBatch::new(writer.store());
+        let mut state = new_state(&writer);
+        writer
+            .insert_dotcell_name(
+                &name,
+                &[],
+                &namespace,
+                &tx_hash,
+                1,
+                100,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+
+        assert!(store.list_dotcell_rings().unwrap().is_empty());
+        assert_eq!(store.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+        // Batch 2 (fresh SporeBatchState): a second namespace must be rejected
+        // even without any decoded ring root.
+        let mut batch = StoreBatch::new(writer.store());
+        let mut state = new_state(&writer);
+        let err = writer
+            .insert_dotcell_name(
+                &name,
+                &[],
+                &[0xFF; 20],
+                &[0xCC; 32],
+                0,
+                101,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a second .cell namespace appeared"),
+            "{err}"
+        );
+
+        // Reopen the store from disk: namespace survives, a second namespace is
+        // still rejected, and a later observation of the same namespace keeps
+        // the persisted row.
+        drop(writer);
+        drop(store);
+        let reopened = Arc::new(CkbadgerStore::open_domain(dir.path()).unwrap());
+        let writer = BatchWriter::new(reopened.clone(), reopened.clone());
+        assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+        let err = writer
+            .insert_dotcell_name(
+                &name,
+                &[],
+                &[0xEE; 20],
+                &[0xDD; 32],
+                0,
+                102,
+                TEST_BLOCK_TIME_MS,
+                &mut StoreBatch::new(writer.store()),
+                &mut new_state(&writer),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a second .cell namespace appeared"),
+            "{err}"
+        );
+
+        let mut batch = StoreBatch::new(writer.store());
+        let mut state = new_state(&writer);
+        writer
+            .insert_dotcell_name(
+                &ring_root_name(),
+                &[],
+                &namespace,
+                &[0xAB; 32],
+                0,
+                105,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+        assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+        // Rollback #1 to block 100 preserves the persisted namespace written at 100.
+        let append_dir = tempfile::tempdir().unwrap();
+        let append = CkbadgerStore::open_append_only(append_dir.path()).unwrap();
+        reopened.rollback_via_undo_log(&append, 100).unwrap();
+        assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+        assert!(reopened.list_dotcell_rings().unwrap().is_empty());
+
+        // Rollback #2 past block 100 (to 99) undoes the persisted namespace row.
+        reopened.rollback_via_undo_log(&append, 99).unwrap();
+        assert_eq!(reopened.get_dotcell_namespace().unwrap(), None);
+        assert_eq!(reopened.resolve_dotcell_namespace().unwrap(), None);
+    }
+
+    #[test]
+    fn old_db_name_only_after_takeover_and_legacy_ring_enforce_namespace_across_reopen_and_rollbacks(
+    ) {
+        let name = support_name();
+        let namespace = mainnet_namespace();
+        let expected_ns = DotCellNamespace {
+            namespace_args: namespace,
+        };
+
+        // Subtest A: old DB with preexisting name-only history (no 0x31, no ring)
+        // after an ordinary expired-name takeover has reset the holding's
+        // created_at_block from 50 to 80.
+        {
+            let (store, writer, dir) = writer_for_test();
+            let mut seed = StoreBatch::new(&store);
+            seed.put_identity(
+                &name.id,
+                &IdentityEntry {
+                    standard: IdentityStandard::DotCell,
+                    owner_lock_hash: None,
+                    name: Some(format!("{}.cell", name.label)),
+                    is_live: true,
+                    created_at_block: 50,
+                    created_at_tx: vec![0x11; 32],
+                    extra: IdentityExtra::DotCell {
+                        label: name.label.clone(),
+                        namespace_args: namespace,
+                        layout_version: 3,
+                        expired_at: 1_000_000,
+                        owner_hash20: [0x44; 20],
+                        manager_hash20: [0x44; 20],
+                        next_id: name.next_id,
+                        records_hash: name.records_hash,
+                        records: vec![],
+                        parent_id: None,
+                    },
+                },
+            );
+            seed.put_identity_by_collection(&DOTCELL_SENTINEL_COLLECTION, &name.id);
+            seed.commit().unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(
+                store.resolve_dotcell_namespace().unwrap(),
+                Some(expected_ns)
+            );
+
+            // Simulate an ordinary expired-name takeover on the legacy DB
+            // (resetting created_at_block to 80 without writing 0x31).
+            let mut takeover_seed = StoreBatch::new(&store);
+            takeover_seed.put_identity(
+                &name.id,
+                &IdentityEntry {
+                    standard: IdentityStandard::DotCell,
+                    owner_lock_hash: None,
+                    name: Some(format!("{}.cell", name.label)),
+                    is_live: true,
+                    created_at_block: 80,
+                    created_at_tx: vec![0x12; 32],
+                    extra: IdentityExtra::DotCell {
+                        label: name.label.clone(),
+                        namespace_args: namespace,
+                        layout_version: 3,
+                        expired_at: 1_900_000_000,
+                        owner_hash20: [0x55; 20],
+                        manager_hash20: [0x55; 20],
+                        next_id: name.next_id,
+                        records_hash: name.records_hash,
+                        records: vec![],
+                        parent_id: None,
+                    },
+                },
+            );
+            takeover_seed.commit().unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(
+                store.resolve_dotcell_namespace().unwrap(),
+                Some(expected_ns)
+            );
+
+            // Different namespace is rejected immediately.
+            let err = writer
+                .insert_dotcell_name(
+                    &ring_root_name(),
+                    &[],
+                    &[0xEE; 20],
+                    &[0x22; 32],
+                    0,
+                    90,
+                    TEST_BLOCK_TIME_MS,
+                    &mut StoreBatch::new(&store),
+                    &mut new_state(&writer),
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("a second .cell namespace appeared"),
+                "{err}"
+            );
+
+            // Matching namespace at block 90 backfills 0x31; block 95 writes
+            // another observation in the same namespace.
+            let mut batch = StoreBatch::new(&store);
+            let mut state = new_state(&writer);
+            writer
+                .insert_dotcell_name(
+                    &ring_root_name(),
+                    &[],
+                    &namespace,
+                    &[0x22; 32],
+                    0,
+                    90,
+                    TEST_BLOCK_TIME_MS,
+                    &mut batch,
+                    &mut state,
+                )
+                .unwrap();
+            batch.commit().unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            let mut batch = StoreBatch::new(&store);
+            let mut state = new_state(&writer);
+            writer
+                .insert_dotcell_name(
+                    &ring_root_name(),
+                    &[],
+                    &namespace,
+                    &[0x23; 32],
+                    0,
+                    95,
+                    TEST_BLOCK_TIME_MS,
+                    &mut batch,
+                    &mut state,
+                )
+                .unwrap();
+            batch.commit().unwrap();
+
+            // Reopen from disk and perform two successive rollbacks:
+            // Rollback #1 (to 90) keeps 0x31; Rollback #2 (to 89) removes 0x31
+            // while the legacy name-only fallback still resolves and enforces
+            // the namespace.
+            drop(writer);
+            drop(store);
+            let reopened = Arc::new(CkbadgerStore::open_domain(dir.path()).unwrap());
+            let writer = BatchWriter::new(reopened.clone(), reopened.clone());
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            let append_dir = tempfile::tempdir().unwrap();
+            let append = CkbadgerStore::open_append_only(append_dir.path()).unwrap();
+            reopened.rollback_via_undo_log(&append, 90).unwrap();
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            reopened.rollback_via_undo_log(&append, 89).unwrap();
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(
+                reopened.resolve_dotcell_namespace().unwrap(),
+                Some(expected_ns)
+            );
+            let err = writer
+                .insert_dotcell_name(
+                    &ring_root_name(),
+                    &[],
+                    &[0xEE; 20],
+                    &[0x24; 32],
+                    0,
+                    90,
+                    TEST_BLOCK_TIME_MS,
+                    &mut StoreBatch::new(&reopened),
+                    &mut new_state(&writer),
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("a second .cell namespace appeared"),
+                "{err}"
+            );
+        }
+
+        // Subtest B: old DB with legacy ring row only (no 0x31).
+        {
+            let (store, writer, _dir) = writer_for_test();
+            let mut seed = StoreBatch::new(&store);
+            seed.put_dotcell_ring(
+                &namespace,
+                &DotCellRingRoot {
+                    root_tx_hash: vec![0x33; 32],
+                    root_output_index: 0,
+                    first_id: [0u8; 20],
+                    created_at_block: 70,
+                },
+            );
+            seed.commit().unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(
+                store.resolve_dotcell_namespace().unwrap(),
+                Some(expected_ns)
+            );
+
+            let err = writer
+                .insert_dotcell_name(
+                    &name,
+                    &[],
+                    &[0xDD; 20],
+                    &[0x44; 32],
+                    0,
+                    80,
+                    TEST_BLOCK_TIME_MS,
+                    &mut StoreBatch::new(&store),
+                    &mut new_state(&writer),
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("a second .cell namespace appeared"),
+                "{err}"
+            );
+
+            let mut batch = StoreBatch::new(&store);
+            let mut state = new_state(&writer);
+            writer
+                .insert_dotcell_name(
+                    &name,
+                    &[],
+                    &namespace,
+                    &[0x44; 32],
+                    0,
+                    80,
+                    TEST_BLOCK_TIME_MS,
+                    &mut batch,
+                    &mut state,
+                )
+                .unwrap();
+            batch.commit().unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            let append_dir = tempfile::tempdir().unwrap();
+            let append = CkbadgerStore::open_append_only(append_dir.path()).unwrap();
+            store.rollback_via_undo_log(&append, 79).unwrap();
+            assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(
+                store.resolve_dotcell_namespace().unwrap(),
+                Some(expected_ns)
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_dotcell_never_establishes_or_alters_namespace() {
+        let (store, writer, _dir) = writer_for_test();
+        let namespace = mainnet_namespace();
+
+        let mut batch = StoreBatch::new(&store);
+        let mut state = new_state(&writer);
+        writer
+            .mark_unsupported_dotcell(&[0x91; 32], 0, 90, &mut batch, &mut state)
+            .unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(store.get_dotcell_namespace().unwrap(), None);
+        assert_eq!(store.resolve_dotcell_namespace().unwrap(), None);
+
+        let mut batch = StoreBatch::new(&store);
+        let mut state = new_state(&writer);
+        writer
+            .insert_dotcell_name(
+                &support_name(),
+                &[],
+                &namespace,
+                &[0x92; 32],
+                0,
+                95,
+                TEST_BLOCK_TIME_MS,
+                &mut batch,
+                &mut state,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(
+            store.get_dotcell_namespace().unwrap(),
+            Some(DotCellNamespace {
+                namespace_args: namespace,
+            })
         );
     }
 }

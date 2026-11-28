@@ -9,7 +9,7 @@ use ckbadger_store::store::{
     CF_STATS_IDENTITY,
 };
 use ckbadger_store::types::{
-    ClusterAggregate, ClusterDailyDelta, CompositionTier, DotCellRingRoot,
+    ClusterAggregate, ClusterDailyDelta, CompositionTier, DotCellNamespace, DotCellRingRoot,
     IdentityCollectionAggregate, IdentityEntry, IdentityExtra, IdentityStandard,
     MnftCollectionAggregate, MnftDailyDelta, MnftTypeIndex, ObjectEntry, ObjectExtra,
     ObjectStandard, SporeDailyDelta, SporeTypeIndex, BIT_CELL_SENTINEL_COLLECTION,
@@ -63,6 +63,8 @@ pub(crate) struct ObjectOwner {
     dotcell_rings: BTreeMap<Vec<u8>, DotCellRingRoot>,
     /// Every `.cell` namespace seen. A network runs exactly one.
     dotcell_namespaces: BTreeSet<Vec<u8>>,
+    /// First recognized `.cell` v3 namespace persisted in `CF_STATS_SPORE`.
+    dotcell_namespace: Option<DotCellNamespace>,
     dotbit_owner_counts: BTreeMap<Vec<u8>, i64>,
     bit_cell_owner_counts: BTreeMap<Vec<u8>, i64>,
     dotbit_outpoints: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -930,6 +932,16 @@ impl ObjectOwner {
             }
         }
         self.dotcell_namespaces.insert(namespace.clone());
+        if self.dotcell_namespace.is_none() {
+            let record = DotCellNamespace {
+                namespace_args: facts.namespace_args,
+            };
+            self.stats_spore_rows.insert(
+                keys::encode_dotcell_namespace_key().to_vec(),
+                bincode::serialize(&record)?,
+            );
+            self.dotcell_namespace = Some(record);
+        }
 
         let output_index = Self::as_i16_outpoint_index(&cell.outpoint, "dotcell")?;
         crate::db::writer::ensure_outpoint_indexable_item_id(

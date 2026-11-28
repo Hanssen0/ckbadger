@@ -51,7 +51,7 @@ pub enum DotCellRead<T> {
 }
 
 impl<T> DotCellRead<T> {
-    pub(crate) fn as_ref(&self) -> DotCellRead<&T> {
+    pub fn as_ref(&self) -> DotCellRead<&T> {
         match self {
             Self::Item(name) => DotCellRead::Item(name),
             Self::Unindexed => DotCellRead::Unindexed,
@@ -60,10 +60,10 @@ impl<T> DotCellRead<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct DotCellProtocolFacts {
-    pub(crate) name: DotCellNameData,
+pub struct DotCellProtocolFacts {
+    pub name: DotCellNameData,
     pub(crate) namespace_args: [u8; 20],
-    pub(crate) records: Vec<DotCellRecord>,
+    pub records: Vec<DotCellRecord>,
 }
 
 pub struct DotCellParser;
@@ -74,23 +74,31 @@ impl DotCellParser {
             .is_some_and(|version| *version != DOTCELL_LAYOUT_VERSION)
     }
 
-    /// DotCell-only backport of upstream read_dotcell. Keep 0.8.3's namespace
-    /// policy and strict v3 validation. Only an unknown layout is unindexed.
-    pub(crate) fn read_dotcell(
+    /// Read the name fields available from cell data alone.
+    pub fn read_name_data(data: &[u8]) -> Result<DotCellRead<DotCellNameData>> {
+        if Self::unsupported_layout(data) {
+            return Ok(DotCellRead::Unindexed);
+        }
+        Self::parse_name_data(data).map(DotCellRead::Item)
+    }
+
+    /// DotCell-only backport of upstream read_dotcell. Dispatch the layout
+    /// before v3-only checks so an explicitly non-v3 layout returns Unindexed;
+    /// keep 0.8.3's strict namespace, payload, witness, and records checks for v3.
+    pub fn read_dotcell(
         type_args: &[u8],
         data: &[u8],
         own_witness: Option<&[u8]>,
     ) -> Result<DotCellRead<DotCellProtocolFacts>> {
+        let DotCellRead::Item(name) = Self::read_name_data(data)? else {
+            return Ok(DotCellRead::Unindexed);
+        };
         let namespace_args: [u8; 20] = type_args.try_into().map_err(|_| {
             anyhow!(
                 "dotcell namespace args must be 20 bytes, got {}",
                 type_args.len()
             )
         })?;
-        if Self::unsupported_layout(data) {
-            return Ok(DotCellRead::Unindexed);
-        }
-        let name = Self::parse_name_data(data)?;
         let witness = own_witness
             .ok_or_else(|| anyhow!("dotcell name cell has no witness at its output index"))?;
         let records = Self::parse_witness_records_bytes(witness, &name.records_hash)?;
@@ -776,5 +784,63 @@ mod tests {
                 "derive_id({label:?})"
             );
         }
+    }
+
+    #[test]
+    fn read_dotcell_returns_unindexed_for_opaque_raw_projection() {
+        let type_args: &[u8] = b"opaque-args";
+        let data: &[u8] = b"opaque-cell-data";
+        assert_eq!(
+            DotCellParser::read_dotcell(type_args, data, None).unwrap(),
+            DotCellRead::Unindexed
+        );
+    }
+
+    #[test]
+    fn read_dotcell_decodes_v3_and_keeps_strict_validation() {
+        let testnet_ns = parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET);
+        let maria_data = parse_hex_to_bytes(fixture::T2_OUT0_DATA);
+        let maria_witness = parse_hex_to_bytes(fixture::T2_WITNESS_0);
+        let wrong_witness = parse_hex_to_bytes(fixture::M2_WITNESS_1);
+
+        let DotCellRead::Item(maria) =
+            DotCellParser::read_dotcell(&testnet_ns, &maria_data, Some(&maria_witness)).unwrap()
+        else {
+            panic!("expected decoded v3 maria projection");
+        };
+        assert_eq!(maria.name.label, "maria");
+        assert_eq!(maria.namespace_args.as_slice(), testnet_ns.as_slice());
+        assert_eq!(maria.records.len(), 6);
+
+        assert!(
+            DotCellParser::read_dotcell(&testnet_ns, &[], Some(&maria_witness))
+                .unwrap_err()
+                .to_string()
+                .contains("too short")
+        );
+        assert!(
+            DotCellParser::read_dotcell(b"short-args", &maria_data, Some(&maria_witness))
+                .unwrap_err()
+                .to_string()
+                .contains("20 bytes")
+        );
+        assert!(DotCellParser::read_dotcell(
+            &testnet_ns,
+            &[DOTCELL_LAYOUT_VERSION; 97],
+            Some(&maria_witness),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("too short"));
+        assert!(DotCellParser::read_dotcell(&testnet_ns, &maria_data, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no witness"));
+        assert!(
+            DotCellParser::read_dotcell(&testnet_ns, &maria_data, Some(&wrong_witness))
+                .unwrap_err()
+                .to_string()
+                .contains("records hash mismatch")
+        );
     }
 }

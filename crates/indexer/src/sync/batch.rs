@@ -1782,7 +1782,7 @@ impl Indexer {
         spore_daily_changes: EntityDailyChanges<EntityDateKey>,
         cluster_daily_changes: EntityDailyChanges<EntityDateKey>,
         mut object_type_index_changes: HashMap<Vec<u8>, MnftTypeIndex>,
-        mut object_daily_changes: EntityDailyChanges<EntityDateKey>,
+        object_daily_changes: EntityDailyChanges<EntityDateKey>,
         chain_tip: u64,
     ) -> Result<BatchWriteMetrics> {
         if all_parsed_blocks.is_empty() {
@@ -2850,6 +2850,9 @@ impl Indexer {
             }
 
             // --- Main pass: per-tx with inputs-before-outputs ---
+            // The parser may already have accumulated object deltas through the
+            // last block. Collect .cell deltas in their own block order.
+            let mut dotcell_daily_changes = EntityDailyChanges::<EntityDateKey>::new();
             let mut block_tx_idx = 0usize;
             for (block_idx, block_response) in blocks.iter().enumerate() {
                 // Protocol state for one block: the longest stretch of the
@@ -2922,7 +2925,7 @@ impl Indexer {
                                     let previous = match layout {
                                         DotCellRead::Unindexed => Some(DotCellRead::Unindexed),
                                         DotCellRead::Item(name_id) => {
-                                            object_daily_changes.add(
+                                            dotcell_daily_changes.add(
                                                 parsed.number,
                                                 (
                                                     DOTCELL_SENTINEL_COLLECTION.to_vec(),
@@ -3236,7 +3239,7 @@ impl Indexer {
                             )?;
                             continue;
                         };
-                        object_daily_changes.add(
+                        dotcell_daily_changes.add(
                             parsed.number,
                             (
                                 DOTCELL_SENTINEL_COLLECTION.to_vec(),
@@ -3396,6 +3399,12 @@ impl Indexer {
                 batch_undo_seq.with(|seq| {
                     self.writer.update_object_daily_deltas_batch(
                         &object_daily_changes,
+                        overlay,
+                        seq,
+                        &mut domain_analytics_batch,
+                    )?;
+                    self.writer.update_object_daily_deltas_batch(
+                        &dotcell_daily_changes,
                         overlay,
                         seq,
                         &mut domain_analytics_batch,
@@ -6516,6 +6525,7 @@ mod tests {
                 indexer,
                 blocks,
                 FixtureTokenDaily::Given(token_daily_changes),
+                EntityDailyChanges::new(),
             )
             .await
         }
@@ -6527,7 +6537,29 @@ mod tests {
             indexer: &Indexer,
             blocks: Vec<BlockResponseWithCycles>,
         ) -> Result<crate::sync::types::BatchWriteMetrics> {
-            write_live_blocks_inner(indexer, blocks, FixtureTokenDaily::FromCells).await
+            write_live_blocks_inner(
+                indexer,
+                blocks,
+                FixtureTokenDaily::FromCells,
+                EntityDailyChanges::new(),
+            )
+            .await
+        }
+
+        /// Same multi-block live write path, supplying parser-accumulated
+        /// `object_daily_changes` alongside the batch's blocks.
+        pub(super) async fn write_live_blocks_with_object_daily(
+            indexer: &Indexer,
+            blocks: Vec<BlockResponseWithCycles>,
+            object_daily_changes: EntityDailyChanges<EntityDateKey>,
+        ) -> Result<crate::sync::types::BatchWriteMetrics> {
+            write_live_blocks_inner(
+                indexer,
+                blocks,
+                FixtureTokenDaily::Given(EntityDailyChanges::new()),
+                object_daily_changes,
+            )
+            .await
         }
 
         enum FixtureTokenDaily {
@@ -6608,6 +6640,7 @@ mod tests {
             indexer: &Indexer,
             blocks: Vec<BlockResponseWithCycles>,
             token_daily: FixtureTokenDaily,
+            object_daily_changes: EntityDailyChanges<EntityDateKey>,
         ) -> Result<crate::sync::types::BatchWriteMetrics> {
             let (all_parsed_blocks, mut all_tx_data, all_input_outpoints) =
                 parse_blocks_parallel(&blocks)?;
@@ -6693,7 +6726,7 @@ mod tests {
                     EntityDailyChanges::new(),
                     EntityDailyChanges::new(),
                     HashMap::new(),
-                    EntityDailyChanges::new(),
+                    object_daily_changes,
                     chain_tip,
                 )
                 .await?;
@@ -9035,6 +9068,241 @@ mod tests {
                 account_lock_party.item_deltas.is_empty(),
                 "the protocol's own lock never owns the names it holds"
             );
+        }
+
+        /// Multi-block live batch where parser-accumulated `object_daily_changes`
+        /// already includes a later block (102) before Group C processes `.cell`
+        /// outputs starting at block 101. Both collections roll back per block.
+        #[tokio::test]
+        async fn mixed_object_and_dotcell_daily_totals_survive_per_block_rollback() {
+            use ckbadger_store::types::{DID_CKB_SENTINEL_COLLECTION, DOTCELL_SENTINEL_COLLECTION};
+
+            let _guard =
+                crate::db::writer::activities::test_detector_override::without_extra_detectors();
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(CkbadgerStore::open_test_unified(dir.path()).unwrap());
+            let indexer = super::live_dao_fee::indexer_for_live_write_test(store.clone());
+            store
+                .set_secondary_epoch_reward(61_369_863_013_698)
+                .unwrap();
+            super::live_dao_fee::seed_pre_parent_header(store.as_ref());
+            super::live_dao_fee::seed_secp_script_info(store.as_ref());
+            for code_hash in [
+                fixture::ACCOUNT_TYPE_CODE_HASH_TESTNET,
+                fixture::ACCOUNT_LOCK_CODE_HASH_TESTNET,
+            ] {
+                super::live_dao_fee::seed_script_info(store.as_ref(), code_hash);
+            }
+
+            let [funding, b101, b102]: [_; 3] = dotcell_registration_blocks().try_into().unwrap();
+            super::live_dao_fee::write_live_block(&indexer, funding)
+                .await
+                .unwrap();
+            let date = keys::timestamp_ms_to_date(
+                BlockParser::parse(&b101.block)
+                    .unwrap()
+                    .timestamp
+                    .timestamp_millis(),
+            );
+            assert_eq!(
+                date,
+                keys::timestamp_ms_to_date(
+                    BlockParser::parse(&b102.block)
+                        .unwrap()
+                        .timestamp
+                        .timestamp_millis()
+                )
+            );
+
+            // Pre-populated parser `object_daily_changes` already reaches block
+            // 102 before Group C processes block 101's `.cell` cells.
+            let mut object_daily_changes = EntityDailyChanges::<EntityDateKey>::new();
+            object_daily_changes
+                .add(
+                    101,
+                    (DID_CKB_SENTINEL_COLLECTION.to_vec(), date),
+                    500_00000000,
+                    140_00000000,
+                )
+                .unwrap();
+            object_daily_changes
+                .add(
+                    102,
+                    (DID_CKB_SENTINEL_COLLECTION.to_vec(), date),
+                    300_00000000,
+                    90_00000000,
+                )
+                .unwrap();
+
+            super::live_dao_fee::write_live_blocks_with_object_daily(
+                &indexer,
+                vec![b101, b102],
+                object_daily_changes,
+            )
+            .await
+            .unwrap();
+
+            let occupied = |data: &str| {
+                occupied_capacity_shannons_i128(
+                    0,
+                    Some(20),
+                    crate::rpc::parse_hex_to_bytes(data).len() as i32,
+                )
+            };
+            let totals = |collection: &[u8]| {
+                store
+                    .get_mnft_daily_delta(collection, date)
+                    .unwrap()
+                    .map(|row| (row.owned_capacity_delta, row.owned_knowledge_delta))
+            };
+            let rollback = |height| {
+                let undo = store.rollback_via_undo_log(store.as_ref(), height).unwrap();
+                store
+                    .rollback_to_block_with_tx_contexts(
+                        height,
+                        Some(store.as_ref()),
+                        undo.tx_contexts,
+                    )
+                    .unwrap();
+            };
+
+            assert_eq!(
+                totals(&DID_CKB_SENTINEL_COLLECTION),
+                Some((800_00000000, 230_00000000))
+            );
+            assert_eq!(
+                totals(&DOTCELL_SENTINEL_COLLECTION),
+                Some((
+                    2 * i128::from(NAME_CAPACITY),
+                    occupied(fixture::T2_OUT0_DATA) + occupied(fixture::T2_OUT1_DATA)
+                ))
+            );
+            rollback(101);
+            assert_eq!(
+                totals(&DID_CKB_SENTINEL_COLLECTION),
+                Some((500_00000000, 140_00000000))
+            );
+            assert_eq!(
+                totals(&DOTCELL_SENTINEL_COLLECTION),
+                Some((i128::from(NAME_CAPACITY), occupied(maria_pre_data())))
+            );
+            rollback(100);
+            assert_eq!(totals(&DID_CKB_SENTINEL_COLLECTION), None);
+            assert_eq!(totals(&DOTCELL_SENTINEL_COLLECTION), None);
+        }
+
+        #[tokio::test]
+        async fn dotcell_namespace_persists_across_batches_reopen_rollback_and_matches_bulk() {
+            use ckbadger_store::types::DotCellNamespace;
+
+            let _guard =
+                crate::db::writer::activities::test_detector_override::without_extra_detectors();
+            let blocks = dotcell_registration_blocks();
+            let bulk = crate::sync::materialize_bulk_artifacts_for_test(&blocks).expect("bulk");
+
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(CkbadgerStore::open_test_unified(dir.path()).unwrap());
+            let indexer = super::live_dao_fee::indexer_for_live_write_test(store.clone());
+            store
+                .set_secondary_epoch_reward(61_369_863_013_698)
+                .unwrap();
+            super::live_dao_fee::seed_pre_parent_header(store.as_ref());
+            super::live_dao_fee::seed_secp_script_info(store.as_ref());
+            for code_hash in [
+                fixture::ACCOUNT_TYPE_CODE_HASH_TESTNET,
+                fixture::ACCOUNT_LOCK_CODE_HASH_TESTNET,
+            ] {
+                super::live_dao_fee::seed_script_info(store.as_ref(), code_hash);
+            }
+
+            // Write one block per live batch (no ring root in any block).
+            for block in blocks {
+                super::live_dao_fee::write_live_block(&indexer, block)
+                    .await
+                    .unwrap();
+            }
+
+            let testnet_ns: [u8; 20] =
+                crate::rpc::parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET)
+                    .try_into()
+                    .unwrap();
+            let expected_ns = DotCellNamespace {
+                namespace_args: testnet_ns,
+            };
+
+            assert!(store.list_dotcell_rings().unwrap().is_empty());
+            assert_eq!(store.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            // Bulk and live persist identical 20-byte `CF_STATS_SPORE` namespace rows.
+            let ns_key = keys::encode_dotcell_namespace_key().to_vec();
+            let live_artifacts =
+                crate::sync::bulk_build::collect_dotcell_artifacts(store.as_ref()).unwrap();
+            assert_eq!(
+                live_artifacts.outpoint_reverse_index.get(&ns_key),
+                bulk.dotcell.outpoint_reverse_index.get(&ns_key),
+                "live and bulk must persist identical DotCellNamespace rows"
+            );
+            let bulk_bytes = bulk
+                .dotcell
+                .outpoint_reverse_index
+                .get(&ns_key)
+                .expect("bulk persisted DotCellNamespace");
+            assert_eq!(bulk_bytes.len(), 20);
+            let bulk_ns: DotCellNamespace = bincode::deserialize(bulk_bytes).unwrap();
+            assert_eq!(bulk_ns, expected_ns);
+
+            // Reopen from disk: namespace survives and rejects a second namespace.
+            drop(indexer);
+            drop(store);
+            let reopened = Arc::new(CkbadgerStore::open_test_unified(dir.path()).unwrap());
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            let writer = crate::db::writer::BatchWriter::new(reopened.clone(), reopened.clone());
+            let mut batch = ckbadger_store::batch::StoreBatch::new(reopened.as_ref());
+            let mut state = writer.new_spore_batch_state(
+                crate::db::writer::entity_stats::SharedEntityStatsOverlay::new(),
+                crate::sync::undo::SharedUndoSeq::default(),
+            );
+            let maria_name =
+                DotCellParser::parse_name_data(&crate::rpc::parse_hex_to_bytes(maria_pre_data()))
+                    .unwrap();
+            let err = writer
+                .insert_dotcell_name(
+                    &maria_name,
+                    &[],
+                    &[0x99; 20],
+                    &[0xf9; 32],
+                    0,
+                    103,
+                    1_700_000_000_000,
+                    &mut batch,
+                    &mut state,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("a second .cell namespace appeared"),
+                "{err}"
+            );
+
+            // Rollback to block 101 preserves the namespace established at 101.
+            let undo = reopened
+                .rollback_via_undo_log(reopened.as_ref(), 101)
+                .unwrap();
+            reopened
+                .rollback_to_block_with_tx_contexts(101, Some(reopened.as_ref()), undo.tx_contexts)
+                .unwrap();
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), Some(expected_ns));
+
+            // Rollback to block 100 undoes the namespace cleanly.
+            let undo = reopened
+                .rollback_via_undo_log(reopened.as_ref(), 100)
+                .unwrap();
+            reopened
+                .rollback_to_block_with_tx_contexts(100, Some(reopened.as_ref()), undo.tx_contexts)
+                .unwrap();
+            assert_eq!(reopened.get_dotcell_namespace().unwrap(), None);
+            assert_eq!(reopened.resolve_dotcell_namespace().unwrap(), None);
         }
     }
 

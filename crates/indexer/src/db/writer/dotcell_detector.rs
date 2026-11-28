@@ -187,16 +187,83 @@ pub(crate) fn is_expired_takeover(
     Ok(grace_end < block_seconds)
 }
 
+/// Reliable `.cell` namespace identity extracted strictly from a cell's
+/// recognized account type script and 20-byte namespace args.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DotCellNamespaceScope {
+    code_hash: [u8; 32],
+    hash_type: i16,
+    namespace_args: [u8; 20],
+}
+
+fn dotcell_namespace_scope(
+    type_code_hash: Option<&[u8]>,
+    type_hash_type: Option<i16>,
+    type_args: Option<&[u8]>,
+) -> Option<DotCellNamespaceScope> {
+    let code_hash = type_code_hash.filter(|h| DotCellParser::is_account_type_script(h))?;
+    let code_hash: [u8; 32] = code_hash.try_into().ok()?;
+    let hash_type = type_hash_type?;
+    let namespace_args: [u8; 20] = type_args?.try_into().ok()?;
+    Some(DotCellNamespaceScope {
+        code_hash,
+        hash_type,
+        namespace_args,
+    })
+}
+
+/// Opacity accumulated on one side (inputs or outputs) of a transaction.
+///
+/// An opaque cell with a reliable account type script and 20-byte namespace
+/// scopes uncertainty to that namespace only. Any opaque cell lacking a
+/// reliable namespace identity falls back conservatively to transaction-wide
+/// uncertainty, as does a decoded cell lacking a reliable namespace when any
+/// opposing opaque cell is present.
+#[derive(Default)]
+struct OpaqueSide {
+    unscoped: bool,
+    scopes: HashSet<DotCellNamespaceScope>,
+}
+
+impl OpaqueSide {
+    fn record(&mut self, scope: Option<DotCellNamespaceScope>) {
+        match scope {
+            Some(scope) => {
+                self.scopes.insert(scope);
+            }
+            None => {
+                self.unscoped = true;
+            }
+        }
+    }
+
+    fn suppresses(&self, scope: Option<DotCellNamespaceScope>) -> bool {
+        if self.unscoped {
+            return true;
+        }
+        if self.scopes.is_empty() {
+            return false;
+        }
+        match scope {
+            Some(scope) => self.scopes.contains(&scope),
+            None => true,
+        }
+    }
+}
+
 /// Diff the `.cell` names on both sides of a transaction.
 pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCellTransition>> {
-    let mut prev: BTreeMap<[u8; 20], &DotCellNameData> = BTreeMap::new();
-    let mut opaque_input = false;
+    let mut prev: BTreeMap<[u8; 20], (&DotCellNameData, Option<DotCellNamespaceScope>)> =
+        BTreeMap::new();
+    let mut opaque_inputs = OpaqueSide::default();
     for input in &tx.inputs {
+        let scope =
+            dotcell_namespace_scope(input.type_code_hash, input.type_hash_type, input.type_args);
         if matches!(input.dotcell, Some(DotCellRead::Unindexed)) {
-            opaque_input = true;
+            opaque_inputs.record(scope);
         }
         if let Some(DotCellRead::Item(name)) = input.dotcell {
-            if prev.insert(name.id, name).is_some() {
+            if prev.insert(name.id, (name, scope)).is_some() {
                 bail!(
                     "dotcell id 0x{} consumed twice in tx 0x{}",
                     hex::encode(name.id),
@@ -205,8 +272,9 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
             }
         }
     }
-    let mut opaque_output = false;
-    let mut next: BTreeMap<[u8; 20], DotCellNameData> = BTreeMap::new();
+    let mut opaque_outputs = OpaqueSide::default();
+    let mut next: BTreeMap<[u8; 20], (DotCellNameData, Option<DotCellNamespaceScope>)> =
+        BTreeMap::new();
     for output in &tx.outputs {
         if !output
             .type_code_hash
@@ -214,14 +282,19 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
         {
             continue;
         }
+        let scope = dotcell_namespace_scope(
+            output.type_code_hash,
+            output.type_hash_type,
+            output.type_args,
+        );
         if DotCellParser::unsupported_layout(output.data) {
-            opaque_output = true;
+            opaque_outputs.record(scope);
             continue;
         }
         let name = DotCellParser::parse_name_data(output.data)
             .map_err(|e| anyhow!("tx 0x{}: {e}", hex::encode(tx.tx_hash)))?;
         let id = name.id;
-        if next.insert(id, name).is_some() {
+        if next.insert(id, (name, scope)).is_some() {
             bail!(
                 "dotcell id 0x{} created twice in tx 0x{}",
                 hex::encode(id),
@@ -229,6 +302,18 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
             );
         }
     }
+    resolve_dotcell_transitions(tx, &prev, &next, &opaque_inputs, &opaque_outputs)
+}
+
+/// Resolve `.cell` transitions from already-classified input/output name maps
+/// and per-side opacity scopes.
+fn resolve_dotcell_transitions(
+    tx: &TxView<'_>,
+    prev: &BTreeMap<[u8; 20], (&DotCellNameData, Option<DotCellNamespaceScope>)>,
+    next: &BTreeMap<[u8; 20], (DotCellNameData, Option<DotCellNamespaceScope>)>,
+    opaque_inputs: &OpaqueSide,
+    opaque_outputs: &OpaqueSide,
+) -> Result<Vec<DotCellTransition>> {
     if prev.is_empty() && next.is_empty() {
         return Ok(Vec::new());
     }
@@ -243,7 +328,8 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
             // the consumed root's facts, live has no identity to rebuild them
             // from), so its meaning must not depend on that side at all.
             (previous, name)
-                if previous.is_some_and(|p| p.is_root()) || name.is_some_and(|n| n.is_root()) =>
+                if previous.is_some_and(|(p, _)| p.is_root())
+                    || name.is_some_and(|(n, _)| n.is_root()) =>
             {
                 DotCellTransition {
                     id,
@@ -253,11 +339,12 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
                     manager_changed_to: None,
                 }
             }
-            // The unseen side could carry the same name. Only report a
-            // registration or recycle when the opposite side is known.
-            (None, Some(_)) if opaque_input => continue,
-            (Some(_), None) if opaque_output => continue,
-            (None, Some(name)) => DotCellTransition {
+            // The unseen side in the same namespace (or an unscoped opaque
+            // cell) could carry the same name. An opaque cell in an unrelated
+            // namespace cannot match this name and must not suppress it.
+            (None, Some((_, scope))) if opaque_inputs.suppresses(*scope) => continue,
+            (Some((_, scope)), None) if opaque_outputs.suppresses(*scope) => continue,
+            (None, Some((name, _))) => DotCellTransition {
                 id,
                 label: name.label.clone(),
                 kind: DotCellTransitionKind::Register {
@@ -271,7 +358,7 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
                 // right here even when it is the owner themselves.
                 manager_changed_to: Some(name.manager_hash20),
             },
-            (Some(previous), None) => DotCellTransition {
+            (Some((previous, _)), None) => DotCellTransition {
                 id,
                 label: previous.label.clone(),
                 kind: DotCellTransitionKind::Recycle {
@@ -280,7 +367,7 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
                 changes: vec!["removed"],
                 manager_changed_to: None,
             },
-            (Some(previous), Some(name)) => {
+            (Some((previous, _)), Some((name, _))) => {
                 if previous.label != name.label {
                     bail!(
                         "dotcell id 0x{} changed label from {:?} to {:?} in tx 0x{} — the id is the label's hash, so this cannot happen",
@@ -915,6 +1002,156 @@ mod tests {
         tx.inputs[0].dotcell = Some(DotCellRead::Unindexed);
         let transitions = classify_dotcell_transitions(&tx.view()).unwrap();
         assert!(transitions.is_empty());
+    }
+
+    fn preclassified_unindexed_input(
+        type_code_hash: Option<Vec<u8>>,
+        type_args: Option<Vec<u8>>,
+    ) -> OwnedCell {
+        OwnedCell {
+            capacity: 200_00000000,
+            lock_script_hash: vec![0x11; 32],
+            lock_code_hash: parse_hex_to_bytes(fixture::ACCOUNT_LOCK_CODE_HASH_TESTNET),
+            lock_args: Vec::new(),
+            type_code_hash,
+            type_args,
+            type_script_hash: None,
+            data: Vec::new(),
+            dotcell: Some(DotCellRead::Unindexed),
+        }
+    }
+
+    #[test]
+    fn opaque_input_namespace_scoping_on_registration() {
+        let same_code = parse_hex_to_bytes(fixture::ACCOUNT_TYPE_CODE_HASH_TESTNET);
+        let same_ns = parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET);
+        let other_ns = vec![0x22; 20];
+
+        // Distinct namespace preclassified input does not suppress `joaom` registration.
+        let mut tx_other = OwnedTx::from_fixture(&fixture::T2_REGISTER_JOAOM);
+        tx_other.inputs.push(preclassified_unindexed_input(
+            Some(same_code.clone()),
+            Some(other_ns),
+        ));
+        let transitions = classify_dotcell_transitions(&tx_other.view()).unwrap();
+        assert!(matches!(
+            kind_of(&transitions, "joaom"),
+            DotCellTransitionKind::Register { .. }
+        ));
+        assert!(matches!(
+            kind_of(&transitions, "maria"),
+            DotCellTransitionKind::RingLink
+        ));
+        let actions = protocol_actions_for(&transitions);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "register");
+
+        // Same namespace preclassified input suppresses `joaom` registration while
+        // keeping the matched `maria` ring link.
+        let mut tx_same = OwnedTx::from_fixture(&fixture::T2_REGISTER_JOAOM);
+        tx_same.inputs.push(preclassified_unindexed_input(
+            Some(same_code.clone()),
+            Some(same_ns),
+        ));
+        let transitions = classify_dotcell_transitions(&tx_same.view()).unwrap();
+        assert!(
+            transitions.iter().all(|t| t.label != "joaom"),
+            "same-namespace opaque input must suppress Register: {transitions:?}"
+        );
+        assert!(matches!(
+            kind_of(&transitions, "maria"),
+            DotCellTransitionKind::RingLink
+        ));
+
+        // Missing namespace evidence conservatively suppresses `joaom` registration.
+        let mut tx_missing = OwnedTx::from_fixture(&fixture::T2_REGISTER_JOAOM);
+        tx_missing
+            .inputs
+            .push(preclassified_unindexed_input(Some(same_code), None));
+        let transitions = classify_dotcell_transitions(&tx_missing.view()).unwrap();
+        assert!(
+            transitions.iter().all(|t| t.label != "joaom"),
+            "missing namespace evidence must conservatively suppress Register: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_output_namespace_scoping_on_recycle() {
+        let same_code = parse_hex_to_bytes(fixture::ACCOUNT_TYPE_CODE_HASH_TESTNET);
+        let same_ns = parse_hex_to_bytes(fixture::NAMESPACE_ARGS_TESTNET);
+        let other_ns = vec![0x22; 20];
+
+        // Ordinary recognized v3 recycle built from `T2_REGISTER_JOAOM`'s `maria` input.
+        let mut tx = OwnedTx::from_fixture(&fixture::T2_REGISTER_JOAOM);
+        tx.outputs.clear();
+        let view = tx.view();
+
+        // Baseline with no opaque output emits Recycle for `maria`.
+        let baseline = classify_dotcell_transitions(&view).unwrap();
+        assert!(matches!(
+            kind_of(&baseline, "maria"),
+            DotCellTransitionKind::Recycle { .. }
+        ));
+        let actions = protocol_actions_for(&baseline);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "recycle");
+
+        // Exercise the same production transition resolver with preclassified
+        // output-side namespace scopes (no unrecognized output bytes).
+        let maria = match tx.inputs[0].dotcell.as_ref() {
+            Some(DotCellRead::Item(name)) => name,
+            other => panic!("expected decoded maria input, got {other:?}"),
+        };
+        let maria_scope = dotcell_namespace_scope(
+            Some(same_code.as_slice()),
+            Some(1),
+            Some(same_ns.as_slice()),
+        );
+        let other_scope = dotcell_namespace_scope(
+            Some(same_code.as_slice()),
+            Some(1),
+            Some(other_ns.as_slice()),
+        );
+        let mut prev = BTreeMap::new();
+        prev.insert(maria.id, (maria, maria_scope));
+        let next = BTreeMap::new();
+        let no_opaque_inputs = OpaqueSide::default();
+
+        // Distinct namespace opaque output does not suppress `maria` recycle.
+        let mut opaque_other = OpaqueSide::default();
+        opaque_other.record(other_scope);
+        let transitions =
+            resolve_dotcell_transitions(&view, &prev, &next, &no_opaque_inputs, &opaque_other)
+                .unwrap();
+        assert!(matches!(
+            kind_of(&transitions, "maria"),
+            DotCellTransitionKind::Recycle { .. }
+        ));
+        let actions = protocol_actions_for(&transitions);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "recycle");
+
+        // Same namespace opaque output suppresses `maria` recycle.
+        let mut opaque_same = OpaqueSide::default();
+        opaque_same.record(maria_scope);
+        let transitions =
+            resolve_dotcell_transitions(&view, &prev, &next, &no_opaque_inputs, &opaque_same)
+                .unwrap();
+        assert!(
+            transitions.is_empty(),
+            "same-namespace opaque output must suppress Recycle: {transitions:?}"
+        );
+
+        // Missing namespace evidence conservatively suppresses `maria` recycle.
+        let mut opaque_missing = OpaqueSide::default();
+        opaque_missing.record(None);
+        let transitions =
+            resolve_dotcell_transitions(&view, &prev, &next, &no_opaque_inputs, &opaque_missing)
+                .unwrap();
+        assert!(
+            transitions.is_empty(),
+            "missing namespace evidence must conservatively suppress Recycle: {transitions:?}"
+        );
     }
 
     fn hex20(hex: &str) -> [u8; 20] {

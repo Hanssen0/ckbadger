@@ -9,8 +9,9 @@ use ckbadger_store::batch::StoreBatch;
 use ckbadger_store::keys;
 use ckbadger_store::store::{CF_IDENTITY_DATA, CF_SPORE_DATA, CF_STATS_SPORE};
 use ckbadger_store::types::{
-    ClusterAggregate, CompositionTier, DotCellRingRoot, IdentityCollectionAggregate, IdentityEntry,
-    IdentityExtra, IdentityStandard, ObjectEntry, ObjectExtra, ObjectStandard, SporeTypeIndex,
+    ClusterAggregate, CompositionTier, DotCellNamespace, DotCellRingRoot,
+    IdentityCollectionAggregate, IdentityEntry, IdentityExtra, IdentityStandard, ObjectEntry,
+    ObjectExtra, ObjectStandard, SporeTypeIndex,
 };
 use ckbadger_store::types::{
     BIT_CELL_SENTINEL_COLLECTION, DID_CKB_SENTINEL_COLLECTION, SOLE_SPORES_SENTINEL_COLLECTION,
@@ -49,9 +50,13 @@ pub(crate) struct SporeBatchState {
     stats: SharedEntityStatsOverlay,
     spore_outpoints: HashMap<(Vec<u8>, i16), Vec<u8>>,
     pub(super) unsupported_dotcell: HashSet<(Vec<u8>, i16)>,
-    /// `.cell` namespaces seen in this batch, plus the ones already on disk.
-    /// A network runs exactly one.
+    /// `.cell` namespaces seen in this batch, plus the ones already on disk
+    /// (persisted namespace row, legacy ring rows, or preexisting decoded
+    /// name-only history). A network runs exactly one.
     dotcell_namespaces: HashSet<[u8; 20]>,
+    /// Persisted `CF_STATS_SPORE` `DOTCELL_NAMESPACE` row (committed or staged
+    /// in this batch), if any.
+    dotcell_persisted_namespace: Option<DotCellNamespace>,
     dotcell_namespaces_loaded: bool,
     dotcell_rings: HashMap<[u8; 20], DotCellRingRoot>,
     pub(super) undo_seq_by_block: SharedUndoSeq,
@@ -259,13 +264,18 @@ impl SporeBatchState {
             .insert((tx_hash.to_vec(), output_index), spore_id.to_vec());
     }
 
-    /// Every `.cell` namespace this store knows: the committed ring rows plus
-    /// anything this batch has already written.
+    /// Every `.cell` namespace this store knows: the persisted namespace row,
+    /// committed ring rows, preexisting decoded name-only history (on old DBs),
+    /// plus anything this batch has already written.
     pub(super) fn dotcell_known_namespaces(
         &mut self,
         store: &CkbadgerStore,
     ) -> Result<Vec<[u8; 20]>> {
         if !self.dotcell_namespaces_loaded {
+            self.dotcell_persisted_namespace = store.get_dotcell_namespace()?;
+            for ns in store.list_known_dotcell_namespaces()? {
+                self.dotcell_namespaces.insert(ns.namespace_args);
+            }
             for (namespace, root) in store.list_dotcell_rings()? {
                 self.dotcell_namespaces.insert(namespace);
                 self.dotcell_rings.insert(namespace, root);
@@ -275,8 +285,13 @@ impl SporeBatchState {
         Ok(self.dotcell_namespaces.iter().copied().collect())
     }
 
-    pub(super) fn remember_dotcell_namespace(&mut self, namespace: [u8; 20]) {
-        self.dotcell_namespaces.insert(namespace);
+    pub(super) fn dotcell_persisted_namespace(&self) -> Option<DotCellNamespace> {
+        self.dotcell_persisted_namespace
+    }
+
+    pub(super) fn record_persisted_dotcell_namespace(&mut self, record: DotCellNamespace) {
+        self.dotcell_namespaces.insert(record.namespace_args);
+        self.dotcell_persisted_namespace = Some(record);
     }
 
     pub(super) fn get_dotcell_ring(

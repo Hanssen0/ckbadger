@@ -1337,6 +1337,12 @@ impl<'a> StoreBatch<'a> {
         self.delete_cf(cf, key);
     }
 
+    pub fn put_dotcell_namespace(&mut self, namespace: &DotCellNamespace) {
+        let key = keys::encode_dotcell_namespace_key();
+        let value = bincode::serialize(namespace).expect("serialize DotCellNamespace");
+        self.put_stats(&key, &value);
+    }
+
     pub fn put_script_info(&mut self, code_hash: &[u8], info: &ScriptInfo) {
         let value = bincode::serialize(info).expect("serialize ScriptInfo");
         self.put_cf(self.store.cf_script_info(), code_hash, &value);

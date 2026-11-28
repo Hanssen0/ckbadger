@@ -105,6 +105,15 @@ An unsupported Cells Account layout is marked in domain `stats_spore` under
 survives consumption and live rollback removes it with its creating block.
 Existing v3 outpoint and cell rows keep their formats.
 
+The recognized v3 `.cell` namespace is stored in domain `stats_spore` under the
+singleton key `0x31` as the 20-byte `namespace_args` (`DotCellNamespace`),
+recorded once on the first recognized v3 ring-root or name observation (live
+sync records its `Object`-scope undo pre-image; bulk build writes it directly).
+Opaque `0x30` rows never establish or alter `0x31`. Preexisting stores without
+`0x31` require no layout migration: namespace discovery reads `0x31` when
+present alongside `dotcell_ring` and falls back to decoded `.cell` entries in
+`identity_data` if `0x31` is absent.
+
 ### `identity_by_collection`: `.cell` parent→child rows
 
 Beside the `(sentinel, identity_id)` row every identity has, a `.cell` sub-name gets a second row
@@ -115,11 +124,26 @@ keyed `pad_id_32(parent_id) ‖ child_id` — the parent's 20-byte name id zero-
   (`is_live = false`) ones included — the same "ever registered" semantics as the sentinel rows.
   Liveness is decided on read: the API's children listing filters `is_live` and pages by child
   id.
-- The forward writers file the row when the sub-name is first inserted (live
-  `db/writer/dotcell.rs`, bulk `sync/bulk_build/owners/object.rs`). It records no undo pre-image:
-  rollback stage 10 range-deletes the whole CF and rebuilds it from the identity entries that
-  survive, writing the parent row for every surviving `IdentityExtra::DotCell` with a
-  `parent_id`, so a rebuilt index equals the forward one (POSTMORTEM IDX-010).
+- Forward writers file both the sentinel row and (for sub-names) the parent row
+  when a `.cell` name is inserted (live `db/writer/dotcell.rs`, bulk
+  `sync/bulk_build/owners/object.rs`):
+  - **Live `.cell` undo**: normal live sync (`put_dotcell_collection_membership`
+    outside bulk sync mode) records `Object`-scope undo pre-images for both the
+    sentinel and sub-name parent writes, so undo-log replay alone restores or
+    removes them.
+  - **Bulk and full-rollback rebuild**: bulk build
+    (`sync/bulk_build/owners/object.rs`) writes `identity_by_collection`
+    directly without undo entries (and live helpers skip undo recording in bulk
+    sync mode). In the full `rollback_to_block` path, stage 10
+    (`repair_spore_object_domain`) range-deletes `identity_by_collection` and
+    rebuilds it from surviving `identity_data` entries — re-emitting sentinel
+    rows and every surviving `IdentityExtra::DotCell` parent row — so a rebuilt
+    index matches the forward one (POSTMORTEM IDX-010).
+  - **Other identity standards**: `did:ckb` (`db/writer/spore.rs`), `.bit Cell`
+    (`db/writer/spore.rs`), and `.bit` AccountCell (`db/writer/dotbit.rs`)
+    writers omit explicit `identity_by_collection` undo pre-images; stage 10
+    rebuilds the CF in the full rollback path rather than during undo-log
+    replay alone.
 
 ### `activities` value: item deltas
 

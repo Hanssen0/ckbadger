@@ -834,6 +834,9 @@ pub mod stats_prefix {
     pub const ACTIVITY_HOURLY_ADDR_SET: u8 = 0x24;
     /// Domain stats_spore: unindexed DotCell outpoint marker (empty value).
     pub const DOTCELL_UNSUPPORTED: u8 = 0x30;
+    /// Domain stats_spore: persisted first recognized `.cell` v3 namespace
+    /// (`DotCellNamespace`, bincode-serialized).
+    pub const DOTCELL_NAMESPACE: u8 = 0x31;
 }
 
 // Flat re-exports for convenience
@@ -874,6 +877,7 @@ pub const STATS_PREFIX_CELL_DISTRIBUTION: u8 = stats_prefix::CELL_DISTRIBUTION;
 pub const STATS_PREFIX_ADDR_COHORT: u8 = stats_prefix::ADDR_COHORT;
 pub const STATS_PREFIX_ACTIVITY_DAILY_ADDR_SET: u8 = stats_prefix::ACTIVITY_DAILY_ADDR_SET;
 pub const STATS_PREFIX_ACTIVITY_HOURLY_ADDR_SET: u8 = stats_prefix::ACTIVITY_HOURLY_ADDR_SET;
+pub const STATS_PREFIX_DOTCELL_NAMESPACE: u8 = stats_prefix::DOTCELL_NAMESPACE;
 
 /// Token transfers total count key: prefix(1B) + type_hash(32B) = 33 bytes
 pub fn encode_token_transfers_key(type_hash: &[u8]) -> Vec<u8> {
@@ -1049,6 +1053,14 @@ pub fn encode_dotcell_unsupported_key(tx_hash: &[u8], output_index: i16) -> [u8;
     key[0] = stats_prefix::DOTCELL_UNSUPPORTED;
     key[1..].copy_from_slice(&encode_outpoint(tx_hash, output_index));
     key
+}
+
+/// Singleton key in `CF_STATS_SPORE` for the persisted recognized `.cell`
+/// v3 namespace (`DotCellNamespace`).
+pub const DOTCELL_NAMESPACE_KEY_SIZE: usize = 1;
+
+pub fn encode_dotcell_namespace_key() -> [u8; DOTCELL_NAMESPACE_KEY_SIZE] {
+    [stats_prefix::DOTCELL_NAMESPACE]
 }
 
 pub fn decode_spore_outpoint_key(key: &[u8]) -> (Vec<u8>, i16) {
