@@ -1,0 +1,167 @@
+name: Package CKBadger 0.8.3 branch
+
+on:
+  pull_request:
+    branches: ['0.8.3', 'hotfix/0.8.3']
+  push:
+    branches: ['0.8.3', 'hotfix/0.8.3']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Build and test CKBadger 0.8.3 (Linux amd64)
+    if: >-
+      github.repository == 'Hanssen0/ckbadger' &&
+      (github.event_name == 'pull_request' ||
+        (github.event_name == 'push' && (github.ref == 'refs/heads/0.8.3' || github.ref == 'refs/heads/hotfix/0.8.3') && !github.event.deleted))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      archive-sha256: ${{ steps.build.outputs.archive-sha256 }}
+      sha-tag: ${{ steps.build.outputs.sha-tag }}
+    steps:
+      # Use the event commit: the pushed tip, or the synthetic PR merge commit.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Test publish verification helper
+        run: python3 packaging/ckbadger-v0.8.3/test_publish_verify.py -v
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libssl-dev zlib1g-dev
+          rustup toolchain install stable --profile minimal
+          npm install --global pnpm@9.15.0
+
+      - name: Build, smoke-test, and export Docker image
+        id: build
+        run: |
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ && $(git rev-parse HEAD) == "$GITHUB_SHA" ]]
+          sha_tag="sha-${GITHUB_SHA:0:12}"
+          [[ $sha_tag =~ ^sha-[0-9a-f]{12}$ ]]
+          output="$RUNNER_TEMP/package-v0.8.3"
+          bash scripts/package-v0.8.3.sh "$output"
+          config_digest=$(python3 packaging/ckbadger-v0.8.3/publish_verify.py config-digest "$output/ckbadger-v0.8.3-linux-amd64.tar" --repo-tag ckbadger:0.8.3)
+          [[ $config_digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'Verified archive config digest: %s\n' "$config_digest"
+          digest=$(sha256sum "$output/ckbadger-v0.8.3-linux-amd64.tar" | cut -d ' ' -f1)
+          printf 'archive-sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'sha-tag=%s\n' "$sha_tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: upload
+        with:
+          name: ckbadger-v0.8.3-linux-amd64-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/package-v0.8.3/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish the tested push SHA to GHCR
+    # The PR can build an artifact, but only a release branch's own push can publish.
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'Hanssen0/ckbadger' &&
+      (github.ref == 'refs/heads/0.8.3' || github.ref == 'refs/heads/hotfix/0.8.3') &&
+      github.event.deleted == false &&
+      needs.package.result == 'success'
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ckbadger-083-ghcr-${{ needs.package.outputs.sha-tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            packaging/ckbadger-v0.8.3
+
+      # No github-token, repository or run-id input: use the current run only.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          path: ${{ runner.temp }}/tested-image
+          merge-multiple: true
+
+      - name: Verify and load the tested image
+        id: verify
+        env:
+          EXPECTED_SHA256: ${{ needs.package.outputs.archive-sha256 }}
+        working-directory: ${{ runner.temp }}/tested-image
+        run: |
+          [[ $EXPECTED_SHA256 =~ ^[0-9a-f]{64}$ && $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
+          archive=ckbadger-v0.8.3-linux-amd64.tar
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict
+          config_digest=$(python3 "$GITHUB_WORKSPACE/packaging/ckbadger-v0.8.3/publish_verify.py" config-digest "$archive" --repo-tag ckbadger:0.8.3)
+          [[ $config_digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker load --input "$archive"
+          expected="linux amd64 https://github.com/Hanssen0/ckbadger $GITHUB_SHA 0.8.3"
+          actual=$(docker image inspect --format '{{.Os}} {{.Architecture}} {{index .Config.Labels "org.opencontainers.image.source"}} {{index .Config.Labels "org.opencontainers.image.revision"}} {{index .Config.Labels "org.opencontainers.image.version"}}' ckbadger:0.8.3)
+          if [[ $actual != "$expected" ]]; then
+            echo '::error::Loaded image does not have the expected platform and push revision.'
+            exit 1
+          fi
+          printf 'config-digest=%s\n' "$config_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish SHA tag once and verify it
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_DIGEST: ${{ steps.verify.outputs.config-digest }}
+          SHA_TAG: ${{ needs.package.outputs.sha-tag }}
+        run: |
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ && $SHA_TAG =~ ^sha-[0-9a-f]{12}$ && $SHA_TAG == "sha-${GITHUB_SHA:0:12}" ]]
+          repo="ghcr.io/hanssen0/ckbadger"
+          tag="${repo}:${SHA_TAG}"
+          helper="$GITHUB_WORKSPACE/packaging/ckbadger-v0.8.3/publish_verify.py"
+          [[ $CONFIG_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+          DOCKER_CONFIG=$(mktemp -d)
+          inspect_err=$(mktemp)
+          export DOCKER_CONFIG
+          trap 'rm -rf -- "$DOCKER_CONFIG" "$inspect_err"' EXIT
+          printf '%s\n' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          unset GHCR_TOKEN
+
+          if raw=$(docker buildx imagetools inspect --raw "$tag" 2>"$inspect_err"); then
+            if printf '%s' "$raw" | python3 "$helper" verify-manifest "$CONFIG_DIGEST" "$repo"; then
+              printf 'Reused existing identical image: `%s`.\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::$tag already exists with a different or unknown image configuration; it was not overwritten."
+            exit 1
+          fi
+          if ! python3 "$helper" is-not-found "$tag" < "$inspect_err"; then
+            cat "$inspect_err" >&2
+            echo "::error::Cannot determine whether $tag already exists; nothing was published."
+            exit 1
+          fi
+
+          docker tag ckbadger:0.8.3 "$tag"
+          docker push "$tag"
+
+          raw=$(docker buildx imagetools inspect --raw "$tag")
+          if ! printf '%s' "$raw" | python3 "$helper" verify-manifest "$CONFIG_DIGEST" "$repo"; then
+            echo "::error::$tag did not verify against the tested image configuration."
+            exit 1
+          fi
+          printf 'Published and verified: `%s`.\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
