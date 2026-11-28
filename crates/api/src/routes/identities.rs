@@ -1389,6 +1389,39 @@ async fn get_dotcell_ring(State(state): State<Arc<AppState>>) -> ApiResult<DotCe
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::not_found(".cell ring root not indexed on this network"))?;
+    // The ring row retains its namespace and creation height after a spend.
+    // Read its outpoint markers in the same pinned view as the ring row.
+    if root.root_tx_hash.len() != 32 || root.root_output_index < 0 {
+        return Err(ApiError::internal(
+            "invalid stored .cell ring root outpoint",
+        ));
+    }
+    let key = ckbadger_store::keys::encode_outpoint(&root.root_tx_hash, root.root_output_index);
+    let marker = |cf| {
+        state
+            .store
+            .get_cf(cf, &key)
+            .map_err(|e| ApiError::internal(e.to_string()))
+    };
+    match (
+        marker(state.store.cf_live_cells())?,
+        marker(state.store.cf_consumed_cells())?,
+    ) {
+        (Some(live), None) if ckbadger_store::types::decode_live_cell_marker(&live).is_some() => {}
+        (None, Some(spent)) => {
+            ckbadger_store::types::decode_consumed_cell_meta(&spent).map_err(|e| {
+                ApiError::internal(format!("invalid spent .cell ring root marker: {e}"))
+            })?;
+            return Err(ApiError::not_found("no live decoded .cell ring root"));
+        }
+        _ => {
+            return Err(ApiError::internal(format!(
+                "inconsistent .cell ring root markers at 0x{}:{}",
+                hex::encode(&root.root_tx_hash),
+                root.root_output_index
+            )))
+        }
+    }
     let live_count = state
         .store
         .get_identity_collection_aggregate(&DOTCELL_SENTINEL_COLLECTION)

@@ -51,7 +51,7 @@ pub enum DotCellRead<T> {
 }
 
 impl<T> DotCellRead<T> {
-    pub(crate) fn as_ref(&self) -> DotCellRead<&T> {
+    pub fn as_ref(&self) -> DotCellRead<&T> {
         match self {
             Self::Item(name) => DotCellRead::Item(name),
             Self::Unindexed => DotCellRead::Unindexed,
@@ -60,10 +60,10 @@ impl<T> DotCellRead<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct DotCellProtocolFacts {
-    pub(crate) name: DotCellNameData,
+pub struct DotCellProtocolFacts {
+    pub name: DotCellNameData,
     pub(crate) namespace_args: [u8; 20],
-    pub(crate) records: Vec<DotCellRecord>,
+    pub records: Vec<DotCellRecord>,
 }
 
 pub struct DotCellParser;
@@ -74,9 +74,17 @@ impl DotCellParser {
             .is_some_and(|version| *version != DOTCELL_LAYOUT_VERSION)
     }
 
+    /// Read the name fields available from cell data alone.
+    pub fn read_name_data(data: &[u8]) -> Result<DotCellRead<DotCellNameData>> {
+        if Self::unsupported_layout(data) {
+            return Ok(DotCellRead::Unindexed);
+        }
+        Self::parse_name_data(data).map(DotCellRead::Item)
+    }
+
     /// DotCell-only backport of upstream read_dotcell. Keep 0.8.3's namespace
     /// policy and strict v3 validation. Only an unknown layout is unindexed.
-    pub(crate) fn read_dotcell(
+    pub fn read_dotcell(
         type_args: &[u8],
         data: &[u8],
         own_witness: Option<&[u8]>,
@@ -87,10 +95,9 @@ impl DotCellParser {
                 type_args.len()
             )
         })?;
-        if Self::unsupported_layout(data) {
+        let DotCellRead::Item(name) = Self::read_name_data(data)? else {
             return Ok(DotCellRead::Unindexed);
-        }
-        let name = Self::parse_name_data(data)?;
+        };
         let witness = own_witness
             .ok_or_else(|| anyhow!("dotcell name cell has no witness at its output index"))?;
         let records = Self::parse_witness_records_bytes(witness, &name.records_hash)?;

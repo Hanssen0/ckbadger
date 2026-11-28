@@ -4151,27 +4151,63 @@ async fn test_assets_dotcell_ring_endpoint() {
         true,
         1_700_000_000_000,
     );
-    {
-        let mut batch = StoreBatch::new(store.as_ref());
-        batch.put_dotcell_ring(
-            &hex20(DOTCELL_NAMESPACE_MAINNET),
-            &ckbadger_store::types::DotCellRingRoot {
-                root_tx_hash: vec![0xA0; 32],
-                root_output_index: 0,
-                first_id: hex20(SUPPORT_ID),
-                created_at_block: 20_515_882,
-            },
-        );
-        batch.commit().unwrap();
-    }
-    let config = test_config(store);
-    let app = create_router(config).await;
-    let (status, body) = dotcell_get(app, "/api/v1/assets/identities/dotcell/ring").await;
+    let namespace = hex20(DOTCELL_NAMESPACE_MAINNET);
+    let root = ckbadger_store::types::DotCellRingRoot {
+        root_tx_hash: vec![0xA0; 32],
+        root_output_index: 0,
+        first_id: hex20(SUPPORT_ID),
+        created_at_block: 20_515_882,
+    };
+    let mut batch = StoreBatch::new(store.as_ref());
+    batch.put_dotcell_ring(&namespace, &root);
+    batch.put_live_cell_marker_by_outpoint(&root.root_tx_hash, 0, root.created_at_block);
+    batch.commit().unwrap();
+
+    let app = create_router(test_config(store.clone())).await;
+    let path = "/api/v1/assets/identities/dotcell/ring";
+    let (status, body) = dotcell_get(app.clone(), path).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["namespaceArgs"], DOTCELL_NAMESPACE_MAINNET);
     assert_eq!(body["firstId"], SUPPORT_ID);
     assert_eq!(body["rootOutPoint"]["index"], 0);
     assert_eq!(body["liveCount"], 1);
+
+    let spent_at = root.created_at_block + 1;
+    let mut batch = StoreBatch::new(store.as_ref());
+    batch.delete_cell(&root.root_tx_hash, 0);
+    batch.put_consumed_cell_meta(&root.root_tx_hash, 0, root.created_at_block, spent_at, None);
+    batch.commit().unwrap();
+    let (status, body) = dotcell_get(app.clone(), path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.get("rootOutPoint").is_none());
+
+    let successor = ckbadger_store::types::DotCellRingRoot {
+        root_tx_hash: vec![0xB0; 32],
+        root_output_index: 2,
+        ..root
+    };
+    let mut batch = StoreBatch::new(store.as_ref());
+    batch.put_dotcell_ring(&namespace, &successor);
+    batch.commit().unwrap();
+    let (status, body) = dotcell_get(app.clone(), path).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+    let mut batch = StoreBatch::new(store.as_ref());
+    batch.put_live_cell_marker_by_outpoint(&successor.root_tx_hash, 2, spent_at + 1);
+    batch.commit().unwrap();
+    let (status, body) = dotcell_get(app.clone(), path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rootOutPoint"]["txHash"],
+        format!("0x{}", hex::encode(&successor.root_tx_hash))
+    );
+    assert_eq!(body["rootOutPoint"]["index"], 2);
+
+    let mut batch = StoreBatch::new(store.as_ref());
+    batch.put_consumed_cell_meta(&successor.root_tx_hash, 2, spent_at + 1, spent_at + 2, None);
+    batch.commit().unwrap();
+    let (status, body) = dotcell_get(app, path).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 }
 
 #[tokio::test]
